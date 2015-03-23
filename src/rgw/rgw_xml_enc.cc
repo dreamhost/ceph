@@ -117,4 +117,3 @@ void RGWBucketWebsiteConf::decode_xml(XMLObj *obj) {
     RGWXMLDecoder::decode_xml("RoutingRules", routing_rules.rules, obj);
   }
 }
-
