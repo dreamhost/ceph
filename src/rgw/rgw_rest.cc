@@ -1358,11 +1358,18 @@ int RGWHandler_ObjStore::retarget(RGWOp *op, RGWOp **new_op) {
     return 0;
   }
 
-  RGWRedirectInfo rinfo;
   rgw_obj_key new_obj;
-  s->bucket_info.website_conf.get_effective_target(s->object.name, &new_obj.name, &rinfo);
+  s->bucket_info.website_conf.get_effective_key(s->object.name, &new_obj.name);
 
+  RGWBWRoutingRule rrule;
+  bool should_redirect = s->bucket_info.website_conf.should_redirect(new_obj.name, &rrule);
 
+  if (should_redirect) {
+    const string& hostname = s->info.env->get("HTTP_HOST", "");
+    const string& protocol = (s->info.env->get("SERVER_PORT_SECURE") ? "https" : "http");
+    rrule.apply_rule(protocol, hostname, new_obj.name, &s->redirect);
+    return -ERR_PERMANENT_REDIRECT;
+  }
 
 #warning FIXME
 #if 0
