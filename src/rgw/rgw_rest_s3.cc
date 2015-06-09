@@ -2718,6 +2718,46 @@ int RGWHandler_Auth_S3::init(RGWRados *store, struct req_state *state, RGWClient
   return RGWHandler_ObjStore::init(store, state, cio);
 }
 
+bool RGWRESTMgr_S3::is_s3website_mode(struct req_state *s)
+{
+  if(!enable_s3website)
+	  return false;
+
+  // If this is true, we already validity the hostname via the dedicated
+  // website endpoint.
+  if(s->prot_flags & RGW_PROTO_WEBSITE)
+	  return true;
+
+  /** S3Website: default_validity
+   * attempt to detect S3Website requests via:
+   * GET & HEAD only
+   * with NO authorization headers
+   * on a bucket with a website block
+   */
+  if(g_conf->rgw_s3website_mode.find("default_validity") != std::string::npos) {
+	  if(s->op != OP_GET && s->op != OP_HEAD) {
+		  return false;
+	  }
+
+	  // There was some talk of S3 implement static auth on websites, so we'd need
+	  // to differentiate that in future. We take a shortcut here by detecting
+	  // that AWS S3 always starts with 'AWS'; we might have issues in future
+	  // if something else wants to use the HTTP-standard 'Basic' start, but
+	  // not be S3Website.
+	  string auth_id = s->info.args.get("AWSAccessKeyId");
+	  bool request_has_authentication = auth_id.size() || (s->http_auth && *(s->http_auth) && strncmp(s->http_auth, "AWS", 3) == 0);
+	  if(request_has_authentication) {
+		  return false;
+	  }
+
+	  s->prot_flags |= RGW_PROTO_WEBSITE; // Actually only if the bucket is ALSO website
+	  return true;
+  }
+
+  return false;
+
+}
+
 RGWHandler *RGWRESTMgr_S3::get_handler(struct req_state *s)
 {
   bool is_s3website = enable_s3website && (s->prot_flags & RGW_PROTO_WEBSITE);

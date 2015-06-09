@@ -1351,40 +1351,6 @@ int RGWHandler_ObjStore::read_permissions(RGWOp *op_obj)
   return do_read_permissions(op_obj, only_bucket);
 }
 
-int RGWHandler_ObjStore::retarget(RGWOp *op, RGWOp **new_op) {
-  *new_op = op;
-
-  if (!s->bucket_info.has_website) {
-    return 0;
-  }
-
-  rgw_obj_key new_obj;
-  s->bucket_info.website_conf.get_effective_key(s->object.name, &new_obj.name);
-
-  RGWBWRoutingRule rrule;
-  bool should_redirect = s->bucket_info.website_conf.should_redirect(new_obj.name, &rrule);
-
-  if (should_redirect) {
-    const string& hostname = s->info.env->get("HTTP_HOST", "");
-    const string& protocol = (s->info.env->get("SERVER_PORT_SECURE") ? "https" : "http");
-    rrule.apply_rule(protocol, hostname, new_obj.name, &s->redirect);
-    return -ERR_PERMANENT_REDIRECT;
-  }
-
-#warning FIXME
-#if 0
-  if (s->object.empty() != new_obj.empty()) {
-    op->put();
-    s->object = new_obj;
-    *new_op = get_op();
-  }
-#endif
-
-  s->object = new_obj;
-
-  return 0;
-}
-
 void RGWRESTMgr::register_resource(string resource, RGWRESTMgr *mgr)
 {
   string r = "/";
@@ -1537,6 +1503,12 @@ int RGWREST::preprocess(struct req_state *s, RGWClientIO *cio)
           << " in_hosted_domain_s3website=" << in_hosted_domain_s3website
           << dendl;
       }
+    }
+
+    if(in_hosted_domain_s3website) {
+      domain = s3website_domain;
+      subdomain = s3website_subdomain;
+      s->prot_flags |= RGW_PROTO_WEBSITE;
     }
 
     if (in_hosted_domain && !subdomain.empty()) {
