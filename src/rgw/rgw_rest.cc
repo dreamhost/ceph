@@ -1505,12 +1505,6 @@ int RGWREST::preprocess(struct req_state *s, RGWClientIO *cio)
       }
     }
 
-    if(in_hosted_domain_s3website) {
-      domain = s3website_domain;
-      subdomain = s3website_subdomain;
-      s->prot_flags |= RGW_PROTO_WEBSITE;
-    }
-
     if (in_hosted_domain && !subdomain.empty()) {
       string encoded_bucket = "/";
       encoded_bucket.append(subdomain);
