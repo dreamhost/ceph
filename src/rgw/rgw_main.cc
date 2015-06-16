@@ -567,7 +567,7 @@ static int process_request(RGWRados *store, RGWREST *rest, RGWRequest *req, RGWC
   RGWRESTMgr *mgr;
   RGWHandler *handler = rest->get_handler(store, s, client_io, &mgr, &init_error);
   if (init_error != 0) {
-    abort_early(s, NULL, init_error);
+    abort_early(s, NULL, init_error, NULL);
     goto done;
   }
   dout(10) << "handler=" << typeid(*handler).name() << dendl;
@@ -577,7 +577,7 @@ static int process_request(RGWRados *store, RGWREST *rest, RGWRequest *req, RGWC
   req->log(s, "getting op");
   op = handler->get_op(store);
   if (!op) {
-    abort_early(s, NULL, -ERR_METHOD_NOT_ALLOWED);
+    abort_early(s, NULL, -ERR_METHOD_NOT_ALLOWED, handler);
     goto done;
   }
   req->op = op;
@@ -587,20 +587,20 @@ static int process_request(RGWRados *store, RGWREST *rest, RGWRequest *req, RGWC
   ret = handler->authorize();
   if (ret < 0) {
     dout(10) << "failed to authorize request" << dendl;
-    abort_early(s, NULL, ret);
+    abort_early(s, NULL, ret, handler);
     goto done;
   }
 
   if (s->user.suspended) {
     dout(10) << "user is suspended, uid=" << s->user.user_id << dendl;
-    abort_early(s, op, -ERR_USER_SUSPENDED);
+    abort_early(s, op, -ERR_USER_SUSPENDED, handler);
     goto done;
   }
 
   req->log(s, "init permissions");
   ret = handler->init_permissions();
   if (ret < 0) {
-    abort_early(s, op, ret);
+    abort_early(s, op, ret, handler);
     goto done;
   }
 
@@ -611,7 +611,7 @@ static int process_request(RGWRados *store, RGWREST *rest, RGWRequest *req, RGWC
   req->log(s, "recalculating target");
   ret = handler->retarget(op, &op);
   if (ret < 0) {
-    abort_early(s, op, ret);
+    abort_early(s, op, ret, handler);
     goto done;
   }
   req->op = op;
@@ -619,21 +619,21 @@ static int process_request(RGWRados *store, RGWREST *rest, RGWRequest *req, RGWC
   req->log(s, "reading permissions");
   ret = handler->read_permissions(op);
   if (ret < 0) {
-    abort_early(s, op, ret);
+    abort_early(s, op, ret, handler);
     goto done;
   }
 
   req->log(s, "init op");
   ret = op->init_processing();
   if (ret < 0) {
-    abort_early(s, op, ret);
+    abort_early(s, op, ret, handler);
     goto done;
   }
 
   req->log(s, "verifying op mask");
   ret = op->verify_op_mask();
   if (ret < 0) {
-    abort_early(s, op, ret);
+    abort_early(s, op, ret, handler);
     goto done;
   }
 
@@ -643,7 +643,7 @@ static int process_request(RGWRados *store, RGWREST *rest, RGWRequest *req, RGWC
     if (s->system_request) {
       dout(2) << "overriding permissions due to system operation" << dendl;
     } else {
-      abort_early(s, op, ret);
+      abort_early(s, op, ret, handler);
       goto done;
     }
   }
@@ -651,7 +651,7 @@ static int process_request(RGWRados *store, RGWREST *rest, RGWRequest *req, RGWC
   req->log(s, "verifying op params");
   ret = op->verify_params();
   if (ret < 0) {
-    abort_early(s, op, ret);
+    abort_early(s, op, ret, handler);
     goto done;
   }
 
