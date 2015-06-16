@@ -63,10 +63,10 @@ bool RGWBWRoutingRules::check_key_condition(const string& key, RGWBWRoutingRule 
   return false;
 }
 
-bool RGWBWRoutingRules::check_error_code_condition(int error_code, RGWBWRoutingRule **rule)
+bool RGWBWRoutingRules::check_error_code_condition(const int http_error_code, RGWBWRoutingRule **rule)
 {
   for (list<RGWBWRoutingRule>::iterator iter = rules.begin(); iter != rules.end(); ++iter) {
-    if (iter->check_error_code_condition(error_code)) {
+    if (iter->check_error_code_condition(http_error_code)) {
       *rule = &(*iter);
       return true;
     }
