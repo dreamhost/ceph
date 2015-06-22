@@ -44,6 +44,7 @@ static const struct rgw_http_attr base_rgw_to_http_attrs[] = {
   { RGW_ATTR_CONTENT_DISP,      "Content-Disposition" },
   { RGW_ATTR_CONTENT_ENC,       "Content-Encoding" },
   { RGW_ATTR_USER_MANIFEST,     "X-Object-Manifest" },
+  { RGW_ATTR_AMZ_WEBSITE_REDIRECT_LOCATION, "Location"},
 };
 
 
