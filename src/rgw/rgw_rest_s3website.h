@@ -32,15 +32,7 @@ protected:
 public:
   RGWHandler_ObjStore_S3Website() : RGWHandler_ObjStore_S3() {}
   virtual ~RGWHandler_ObjStore_S3Website() {}
-  virtual int error_handler(int err_no, string error_content);
-};
-
-class RGWHandler_ObjStore_Service_S3Website : public RGWHandler_ObjStore_S3Website {
-protected:
-  virtual RGWOp *get_obj_op(bool get_data);
-public:
-  RGWHandler_ObjStore_Service_S3Website() {}
-  virtual ~RGWHandler_ObjStore_Service_S3Website() {}
+  virtual int error_handler(int err_no, string *error_content);
 };
 
 class RGWHandler_ObjStore_Obj_S3Website : public RGWHandler_ObjStore_S3Website {

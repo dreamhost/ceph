@@ -2832,8 +2832,7 @@ int RGWHandler_ObjStore_S3Website::error_handler(int err_no, string error_conten
     ldout(s->cct, 10) << "error handler redirect code=" << redirect_code << " proto+host:" << protocol << "://" << hostname << " -> " << s->redirect << dendl;
     return -ERR_WEBSITE_REDIRECT;
   } else if(!s->bucket_info.website_conf.error_doc.empty()) {
-    ldout(s->cct, 20) << "TODO Serve Custom error page here if bucket has <Error>" << dendl;
-    error_content = s->bucket_info.website_conf.error_doc;
+    RGWHandler_ObjStore_S3Website::get_errordoc(s->bucket_info.website_conf.error_doc, error_content);
   } else {
     ldout(s->cct, 20) << "No special error handling today!" << dendl;
   }
