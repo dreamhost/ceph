@@ -45,6 +45,7 @@ libcommon_internal_la_SOURCES = \
 	common/Thread.cc \
 	common/Formatter.cc \
 	common/XMLFormatter.cc \
+	common/HTMLFormatter.cc \
 	common/JSONFormatter.cc \
 	common/TableFormatter.cc \
 	common/HeartbeatMap.cc \
@@ -207,6 +208,7 @@ noinst_HEADERS += \
 	common/JSONFormatter.h \
 	common/TableFormatter.h \
 	common/XMLFormatter.h \
+	common/HTMLFormatter.h \
 	common/perf_counters.h \
 	common/OutputDataSocket.h \
 	common/admin_socket.h \
