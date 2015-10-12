@@ -204,7 +204,7 @@ void rgw_rest_init(CephContext *cct, RGWRegion& region)
     hostnames_set.insert(cct->_conf->rgw_dns_name);
   }
   hostnames_set.insert(region.hostnames.begin(),  region.hostnames.end());
-  string s("");
+  string s;
   ldout(cct, 20) << "RGW hostnames: " << std::accumulate(hostnames_set.begin(), hostnames_set.end(), s) << dendl;
   /* TODO: We should have a sanity check that no hostname matches the end of
    * any other hostname, otherwise we will get ambigious results from
@@ -216,11 +216,11 @@ void rgw_rest_init(CephContext *cct, RGWRegion& region)
    * X.B.A ambigously splits to both {X, B.A} and {X.B, A}
    */
 
-  if(!cct->_conf->rgw_dns_s3website_name.empty()) {
+  if (!cct->_conf->rgw_dns_s3website_name.empty()) {
     hostnames_s3website_set.insert(cct->_conf->rgw_dns_s3website_name);
   }
   hostnames_s3website_set.insert(region.hostnames_s3website.begin(), region.hostnames_s3website.end());
-  s.assign("");
+  s.clear();
   ldout(cct, 20) << "RGW S3website hostnames: " << std::accumulate(hostnames_s3website_set.begin(), hostnames_s3website_set.end(), s) << dendl;
   /* TODO: we should repeat the hostnames_set sanity check here
    * and ALSO decide about overlap, if any
@@ -321,7 +321,7 @@ void set_req_state_err(struct req_state *s, int err_no)
 
   r = search_err(err_no, RGW_HTTP_ERRORS, ARRAY_LEN(RGW_HTTP_ERRORS));
   if (r) {
-    if(s->prot_flags & RGW_PROTO_WEBSITE && err_no == ERR_WEBSITE_REDIRECT && !s->err.is_clear()) {
+    if (s->prot_flags & RGW_PROTO_WEBSITE && err_no == ERR_WEBSITE_REDIRECT && !s->err.is_clear()) {
       // http_ret was custom set, so don't change it!
     } else {
       s->err.http_ret = r->http_ret;
@@ -586,7 +586,7 @@ void end_header(struct req_state *s, RGWOp *op, const char *content_type, const 
   }
   if (!force_no_error && s->err.is_err()) {
     dump_start(s);
-    if(s->format != RGW_FORMAT_HTML) {
+    if (s->format != RGW_FORMAT_HTML) {
       s->formatter->open_object_section("Error");
     }
     if (!s->err.s3_code.empty())
@@ -598,7 +598,7 @@ void end_header(struct req_state *s, RGWOp *op, const char *content_type, const 
     if (!s->bucket_name_str.empty()) // TODO: connect to expose_bucket
       s->formatter->dump_string("BucketName", s->bucket_name_str);
     s->formatter->dump_string("HostId", "FIXME-TODO-How-does-amazon-generate-HostId"); // TODO, FIXME
-    if(s->format != RGW_FORMAT_HTML) {
+    if (s->format != RGW_FORMAT_HTML) {
       s->formatter->close_section();
     }
     s->formatter->output_footer();
@@ -634,12 +634,12 @@ void abort_early(struct req_state *s, RGWOp *op, int err_no, RGWHandler* handler
   }
 
   // op->error_handler is responsible for calling it's handler error_handler
-  if(op != NULL) {
+  if (op != NULL) {
     int new_err_no;
     new_err_no = op->error_handler(err_no, &error_content);
     ldout(s->cct, 20) << "op->ERRORHANDLER: err_no=" << err_no << " new_err_no=" << new_err_no << dendl;
     err_no = new_err_no;
-  } else if(handler != NULL) {
+  } else if (handler != NULL) {
     int new_err_no;
     new_err_no = handler->error_handler(err_no, &error_content);
     ldout(s->cct, 20) << "handler->ERRORHANDLER: err_no=" << err_no << " new_err_no=" << new_err_no << dendl;
@@ -670,7 +670,7 @@ void abort_early(struct req_state *s, RGWOp *op, int err_no, RGWHandler* handler
       dump_redirect(s, dest_uri);
     }
   }
-  if(!error_content.empty()) {
+  if (!error_content.empty()) {
     ldout(s->cct, 20) << "error_content is set, we need to serve it INSTEAD of firing the formatter" << dendl;
 #warning TODO we must add all error entries as headers here
     end_header(s, op, NULL, NO_CONTENT_LENGTH, false, true);
@@ -1458,7 +1458,7 @@ int RGWREST::preprocess(struct req_state *s, RGWClientIO *cio)
 
     if (s3website_enabled) {
       in_hosted_domain_s3website = rgw_find_host_in_domains(info.host, &s3website_domain, &s3website_subdomain, hostnames_s3website_set);
-      if(in_hosted_domain_s3website) {
+      if (in_hosted_domain_s3website) {
 	in_hosted_domain = true; // TODO: should hostnames be a strict superset of hostnames_s3website?
         domain = s3website_domain;
         subdomain = s3website_subdomain;
@@ -1486,9 +1486,9 @@ int RGWREST::preprocess(struct req_state *s, RGWClientIO *cio)
 			 << cname << dendl;
         in_hosted_domain = rgw_find_host_in_domains(cname, &domain, &subdomain, hostnames_set);
 
-        if(s3website_enabled && !in_hosted_domain_s3website) {
+        if (s3website_enabled && !in_hosted_domain_s3website) {
             in_hosted_domain_s3website = rgw_find_host_in_domains(cname, &s3website_domain, &s3website_subdomain, hostnames_s3website_set);
-	    if(in_hosted_domain_s3website) {
+	    if (in_hosted_domain_s3website) {
 	      in_hosted_domain = true; // TODO: should hostnames be a strict superset of hostnames_s3website?
 	      domain = s3website_domain;
 	      subdomain = s3website_subdomain;
