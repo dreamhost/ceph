@@ -214,18 +214,6 @@ public:
   }
 };
 
-class RGWGetObj_CB : public RGWGetDataCB
-{
-  RGWGetObj *op;
-public:
-  RGWGetObj_CB(RGWGetObj *_op) : op(_op) {}
-  virtual ~RGWGetObj_CB() {}
-
-  int handle_data(bufferlist& bl, off_t bl_ofs, off_t bl_len) {
-    return op->get_data_cb(bl, bl_ofs, bl_len);
-  }
-};
-
 #define RGW_LIST_BUCKETS_LIMIT_MAX 10000
 
 class RGWListBuckets : public RGWOp {
