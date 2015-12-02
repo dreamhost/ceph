@@ -39,6 +39,8 @@ enum RGWOpType {
   RGW_OP_GET_BUCKET_LOGGING,
   RGW_OP_GET_BUCKET_VERSIONING,
   RGW_OP_SET_BUCKET_VERSIONING,
+  RGW_OP_GET_BUCKET_WEBSITE,
+  RGW_OP_SET_BUCKET_WEBSITE,
   RGW_OP_STAT_BUCKET,
   RGW_OP_CREATE_BUCKET,
   RGW_OP_DELETE_BUCKET,
@@ -64,6 +66,14 @@ enum RGWOpType {
   RGW_OP_LIST_MULTIPART,
   RGW_OP_LIST_BUCKET_MULTIPARTS,
   RGW_OP_DELETE_MULTI_OBJ,
+};
+
+enum RGWEndpointType {
+  RGW_ENDPOINT_REST,
+  RGW_ENDPOINT_REST_SWIFT,
+  RGW_ENDPOINT_REST_SWIFT_AUTH,
+  RGW_ENDPOINT_REST_S3,
+  RGW_ENDPOINT_WEBSITE,
 };
 
 /**
@@ -114,6 +124,11 @@ public:
   virtual RGWOpType get_type() { return RGW_OP_UNKNOWN; }
 
   virtual uint32_t op_mask() { return 0; }
+  virtual bool supports_website() {
+    return false;
+  }
+
+  virtual int error_handler(int err_no, string *error_content);
 };
 
 class RGWGetObj : public RGWOp {
@@ -186,6 +201,21 @@ public:
   virtual RGWOpType get_type() { return RGW_OP_GET_OBJ; }
   virtual uint32_t op_mask() { return RGW_OP_TYPE_READ; }
   virtual bool need_object_expiration() { return false; }
+  virtual bool supports_website() {
+    return true;
+  }
+};
+
+class RGWGetObj_CB : public RGWGetDataCB
+{
+  RGWGetObj *op;
+public:
+  RGWGetObj_CB(RGWGetObj *_op) : op(_op) {}
+  virtual ~RGWGetObj_CB() {}
+
+  int handle_data(bufferlist& bl, off_t bl_ofs, off_t bl_len) {
+    return op->get_data_cb(bl, bl_ofs, bl_len);
+  }
 };
 
 #define RGW_LIST_BUCKETS_LIMIT_MAX 10000
@@ -227,6 +257,9 @@ public:
   virtual const string name() { return "list_buckets"; }
   virtual RGWOpType get_type() { return RGW_OP_LIST_BUCKETS; }
   virtual uint32_t op_mask() { return RGW_OP_TYPE_READ; }
+  virtual bool supports_website() {
+    return true;
+  }
 };
 
 class RGWStatAccount : public RGWOp {
@@ -348,6 +381,57 @@ public:
   virtual void send_response() = 0;
   virtual const string name() { return "set_bucket_versioning"; }
   virtual RGWOpType get_type() { return RGW_OP_SET_BUCKET_VERSIONING; }
+  virtual uint32_t op_mask() { return RGW_OP_TYPE_WRITE; }
+};
+
+class RGWGetBucketWebsite : public RGWOp {
+protected:
+  int ret;
+public:
+  RGWGetBucketWebsite() : ret(0) {}
+
+  int verify_permission();
+  void pre_exec();
+  void execute();
+
+  virtual void send_response() = 0;
+  virtual const string name() { return "get_bucket_website"; }
+  virtual RGWOpType get_type() { return RGW_OP_GET_BUCKET_WEBSITE; }
+  virtual uint32_t op_mask() { return RGW_OP_TYPE_READ; }
+};
+
+class RGWSetBucketWebsite : public RGWOp {
+protected:
+  int ret;
+  RGWBucketWebsiteConf website_conf;
+public:
+  RGWSetBucketWebsite() : ret(0) {}
+
+  int verify_permission();
+  void pre_exec();
+  void execute();
+
+  virtual int get_params() { return 0; }
+
+  virtual void send_response() = 0;
+  virtual const string name() { return "set_bucket_website"; }
+  virtual RGWOpType get_type() { return RGW_OP_SET_BUCKET_WEBSITE; }
+  virtual uint32_t op_mask() { return RGW_OP_TYPE_WRITE; }
+};
+
+class RGWDeleteBucketWebsite : public RGWOp {
+protected:
+  int ret;
+public:
+  RGWDeleteBucketWebsite() : ret(0) {}
+
+  int verify_permission();
+  void pre_exec();
+  void execute();
+
+  virtual void send_response() = 0;
+  virtual const string name() { return "delete_bucket_website"; }
+  virtual RGWOpType get_type() { return RGW_OP_SET_BUCKET_WEBSITE; }
   virtual uint32_t op_mask() { return RGW_OP_TYPE_WRITE; }
 };
 
@@ -1125,6 +1209,7 @@ protected:
   RGWRados *store;
   struct req_state *s;
 
+  int do_init_permissions();
   int do_read_permissions(RGWOp *op, bool only_bucket);
 
   virtual RGWOp *op_get() { return NULL; }
@@ -1141,8 +1226,16 @@ public:
 
   virtual RGWOp *get_op(RGWRados *store);
   virtual void put_op(RGWOp *op);
+  virtual int init_permissions() {
+    return 0;
+  }
+  virtual int retarget(RGWOp *op, RGWOp **new_op) {
+    *new_op = op;
+    return 0;
+  }
   virtual int read_permissions(RGWOp *op) = 0;
   virtual int authorize() = 0;
+  virtual int error_handler(int err_no, string *error_content);
 };
 
 #endif

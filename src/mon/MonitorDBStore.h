@@ -25,6 +25,7 @@
 
 #include "include/assert.h"
 #include "common/Formatter.h"
+#include "common/JSONFormatter.h"
 #include "common/Finisher.h"
 #include "common/errno.h"
 #include "common/debug.h"

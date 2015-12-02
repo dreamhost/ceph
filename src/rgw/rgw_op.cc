@@ -341,7 +341,7 @@ static int read_policy(RGWRados *store, struct req_state *s,
  * only_bucket: If true, reads the bucket ACL rather than the object ACL.
  * Returns: 0 on success, -ERR# otherwise.
  */
-static int rgw_build_policies(RGWRados *store, struct req_state *s, bool only_bucket, bool prefetch_data)
+static int rgw_build_bucket_policies(RGWRados *store, struct req_state *s)
 {
   int ret = 0;
   rgw_obj_key obj;
@@ -430,9 +430,20 @@ static int rgw_build_policies(RGWRados *store, struct req_state *s, bool only_bu
     }
   }
 
-  /* we're passed only_bucket = true when we specifically need the bucket's
-     acls, that happens on write operations */
-  if (!only_bucket && !s->object.empty()) {
+  return 0;
+}
+
+/**
+ * Get the AccessControlPolicy for a bucket or object off of disk.
+ * s: The req_state to draw information from.
+ * only_bucket: If true, reads the bucket ACL rather than the object ACL.
+ * Returns: 0 on success, -ERR# otherwise.
+ */
+static int rgw_build_object_policies(RGWRados *store, struct req_state *s, bool prefetch_data)
+{
+  int ret = 0;
+
+  if (!s->object.empty()) {
     if (!s->bucket_exists) {
       return -ERR_NO_SUCH_BUCKET;
     }
@@ -870,18 +881,6 @@ int RGWGetObj::handle_user_manifest(const char *prefix)
   return 0;
 }
 
-class RGWGetObj_CB : public RGWGetDataCB
-{
-  RGWGetObj *op;
-public:
-  RGWGetObj_CB(RGWGetObj *_op) : op(_op) {}
-  virtual ~RGWGetObj_CB() {}
-
-  int handle_data(bufferlist& bl, off_t bl_ofs, off_t bl_len) {
-    return op->get_data_cb(bl, bl_ofs, bl_len);
-  }
-};
-
 int RGWGetObj::get_data_cb(bufferlist& bl, off_t bl_ofs, off_t bl_len)
 {
   /* garbage collection related handling */
@@ -1217,6 +1216,81 @@ void RGWSetBucketVersioning::execute()
   } else {
     s->bucket_info.flags |= (BUCKET_VERSIONED | BUCKET_VERSIONS_SUSPENDED);
   }
+
+  ret = store->put_bucket_instance_info(s->bucket_info, false, 0, &s->bucket_attrs);
+  if (ret < 0) {
+    ldout(s->cct, 0) << "NOTICE: put_bucket_info on bucket=" << s->bucket.name << " returned err=" << ret << dendl;
+    return;
+  }
+}
+
+int RGWGetBucketWebsite::verify_permission()
+{
+  if (s->user.user_id.compare(s->bucket_owner.get_id()) != 0)
+    return -EACCES;
+
+  return 0;
+}
+
+void RGWGetBucketWebsite::pre_exec()
+{
+  rgw_bucket_object_pre_exec(s);
+}
+
+void RGWGetBucketWebsite::execute()
+{
+  if (!s->bucket_info.has_website) {
+    ret = -ENOENT;
+  }
+}
+
+int RGWSetBucketWebsite::verify_permission()
+{
+  if (s->user.user_id.compare(s->bucket_owner.get_id()) != 0)
+    return -EACCES;
+
+  return 0;
+}
+
+void RGWSetBucketWebsite::pre_exec()
+{
+  rgw_bucket_object_pre_exec(s);
+}
+
+void RGWSetBucketWebsite::execute()
+{
+  ret = get_params();
+
+  if (ret < 0)
+    return;
+
+  s->bucket_info.has_website = true;
+  s->bucket_info.website_conf = website_conf;
+
+  ret = store->put_bucket_instance_info(s->bucket_info, false, 0, &s->bucket_attrs);
+  if (ret < 0) {
+    ldout(s->cct, 0) << "NOTICE: put_bucket_info on bucket=" << s->bucket.name << " returned err=" << ret << dendl;
+    return;
+  }
+}
+
+int RGWDeleteBucketWebsite::verify_permission()
+{
+  if (s->user.user_id.compare(s->bucket_owner.get_id()) != 0)
+    return -EACCES;
+
+  return 0;
+}
+
+void RGWDeleteBucketWebsite::pre_exec()
+{
+  rgw_bucket_object_pre_exec(s);
+}
+
+void RGWDeleteBucketWebsite::execute()
+{
+  s->bucket_info.has_website = false;
+  s->bucket_info.website_conf = RGWBucketWebsiteConf();
 
   ret = store->put_bucket_instance_info(s->bucket_info, false, 0, &s->bucket_attrs);
   if (ret < 0) {
@@ -3595,7 +3669,7 @@ void RGWListBucketMultiparts::execute()
   if (ret < 0)
     return;
 
-  if (s->prot_flags & RGW_REST_SWIFT) {
+  if (s->prot_flags & RGW_PROTO_SWIFT) {
     string path_args;
     path_args = s->info.args.get("path");
     if (!path_args.empty()) {
@@ -3739,12 +3813,29 @@ int RGWHandler::init(RGWRados *_store, struct req_state *_s, RGWClientIO *cio)
   return 0;
 }
 
-int RGWHandler::do_read_permissions(RGWOp *op, bool only_bucket)
+int RGWHandler::do_init_permissions()
 {
-  int ret = rgw_build_policies(store, s, only_bucket, op->prefetch_data());
+  int ret = rgw_build_bucket_policies(store, s);
 
   if (ret < 0) {
-    ldout(s->cct, 10) << "read_permissions on " << s->bucket << ":" <<s->object << " only_bucket=" << only_bucket << " ret=" << ret << dendl;
+    ldout(s->cct, 10) << "read_permissions on " << s->bucket << " ret=" << ret << dendl;
+    if (ret == -ENODATA)
+      ret = -EACCES;
+  }
+
+  return ret;
+}
+
+int RGWHandler::do_read_permissions(RGWOp *op, bool only_bucket)
+{
+  if (only_bucket) {
+    /* already read bucket info */
+    return 0;
+  }
+  int ret = rgw_build_object_policies(store, s, op->prefetch_data());
+
+  if (ret < 0) {
+    ldout(s->cct, 10) << "read_permissions on " << s->bucket << ":" << s->object << " ret=" << ret << dendl;
     if (ret == -ENODATA)
       ret = -EACCES;
   }
@@ -3793,3 +3884,11 @@ void RGWHandler::put_op(RGWOp *op)
   delete op;
 }
 
+int RGWOp::error_handler(int err_no, string *error_content) {
+  return dialect_handler->error_handler(err_no, error_content);
+}
+
+int RGWHandler::error_handler(int err_no, string *error_content) {
+  // This is the do-nothing error handler
+  return err_no;
+}

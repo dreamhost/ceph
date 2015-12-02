@@ -31,6 +31,7 @@
 #include "rgw_cors.h"
 #include "rgw_quota.h"
 #include "rgw_string.h"
+#include "rgw_website.h"
 #include "cls/version/cls_version_types.h"
 #include "cls/user/cls_user_types.h"
 #include "cls/rgw/cls_rgw_types.h"
@@ -50,7 +51,9 @@ using ceph::crypto::MD5;
 #define RGW_HTTP_RGWX_ATTR_PREFIX "RGWX_ATTR_"
 #define RGW_HTTP_RGWX_ATTR_PREFIX_OUT "Rgwx-Attr-"
 
-#define RGW_AMZ_META_PREFIX "x-amz-meta-"
+#define RGW_AMZ_PREFIX "x-amz-"
+#define RGW_AMZ_META_PREFIX RGW_AMZ_PREFIX "meta-"
+#define RGW_AMZ_WEBSITE_REDIRECT_LOCATION RGW_AMZ_PREFIX "website-redirect-location"
 
 #define RGW_SYS_PARAM_PREFIX "rgwx-"
 
@@ -70,6 +73,7 @@ using ceph::crypto::MD5;
 #define RGW_ATTR_SHADOW_OBJ    	RGW_ATTR_PREFIX "shadow_name"
 #define RGW_ATTR_MANIFEST    	RGW_ATTR_PREFIX "manifest"
 #define RGW_ATTR_USER_MANIFEST  RGW_ATTR_PREFIX "user_manifest"
+#define RGW_ATTR_AMZ_WEBSITE_REDIRECT_LOCATION	RGW_ATTR_PREFIX RGW_AMZ_WEBSITE_REDIRECT_LOCATION
 
 #define RGW_ATTR_TEMPURL_KEY1   RGW_ATTR_META_PREFIX "temp-url-key"
 #define RGW_ATTR_TEMPURL_KEY2   RGW_ATTR_META_PREFIX "temp-url-key-2"
@@ -89,13 +93,16 @@ using ceph::crypto::MD5;
 #define RGW_FORMAT_PLAIN        0
 #define RGW_FORMAT_XML          1
 #define RGW_FORMAT_JSON         2
+#define RGW_FORMAT_HTML         3
 
 #define RGW_CAP_READ            0x1
 #define RGW_CAP_WRITE           0x2
 #define RGW_CAP_ALL             (RGW_CAP_READ | RGW_CAP_WRITE)
 
-#define RGW_REST_SWIFT          0x1
-#define RGW_REST_SWIFT_AUTH     0x2
+#define RGW_PROTO_SWIFT          0x1
+#define RGW_PROTO_SWIFT_AUTH     0x2
+#define RGW_PROTO_S3             0x4
+#define RGW_PROTO_WEBSITE     0x8
 
 #define RGW_SUSPENDED_USER_AUID (uint64_t)-2
 
@@ -150,6 +157,8 @@ using ceph::crypto::MD5;
 #define ERR_INVALID_ACCESS_KEY   2028
 #define ERR_MALFORMED_XML        2029
 #define ERR_USER_EXIST           2030
+#define ERR_WEBSITE_REDIRECT     2031
+#define ERR_NO_SUCH_WEBSITE_CONFIGURATION 2032
 #define ERR_USER_SUSPENDED       2100
 #define ERR_INTERNAL_ERROR       2200
 #define ERR_NOT_IMPLEMENTED      2201
@@ -257,6 +266,7 @@ class RGWHTTPArgs
   bool has_resp_modifier;
  public:
   RGWHTTPArgs() : has_resp_modifier(false) {}
+
   /** Set the arguments; as received */
   void set(string s) {
     has_resp_modifier = false;
@@ -796,8 +806,12 @@ struct RGWBucketInfo
 
   bool requester_pays;
 
+  // Represents the status and configuration for WebsiteConfiguration
+  bool has_website;
+  RGWBucketWebsiteConf website_conf;
+
   void encode(bufferlist& bl) const {
-     ENCODE_START(12, 4, bl);
+     ENCODE_START(13, 4, bl);
      ::encode(bucket, bl);
      ::encode(owner, bl);
      ::encode(flags, bl);
@@ -810,6 +824,10 @@ struct RGWBucketInfo
      ::encode(num_shards, bl);
      ::encode(bucket_index_shard_hash_type, bl);
      ::encode(requester_pays, bl);
+     ::encode(has_website, bl);
+     if (has_website) {
+       ::encode(website_conf, bl);
+     }
      ENCODE_FINISH(bl);
   }
   void decode(bufferlist::iterator& bl) {
@@ -838,6 +856,14 @@ struct RGWBucketInfo
        ::decode(bucket_index_shard_hash_type, bl);
      if (struct_v >= 12)
        ::decode(requester_pays, bl);
+     if (struct_v >= 13) {
+       ::decode(has_website, bl);
+       if (has_website) {
+         ::decode(website_conf, bl);
+       } else {
+         website_conf = RGWBucketWebsiteConf();
+       }
+     }
      DECODE_FINISH(bl);
   }
   void dump(Formatter *f) const;
@@ -849,7 +875,7 @@ struct RGWBucketInfo
   int versioning_status() { return flags & (BUCKET_VERSIONED | BUCKET_VERSIONS_SUSPENDED); }
   bool versioning_enabled() { return versioning_status() == BUCKET_VERSIONED; }
 
-  RGWBucketInfo() : flags(0), creation_time(0), has_instance_obj(false), num_shards(0), bucket_index_shard_hash_type(MOD), requester_pays(false) {}
+  RGWBucketInfo() : flags(0), creation_time(0), has_instance_obj(false), num_shards(0), bucket_index_shard_hash_type(MOD), requester_pays(false), has_website(false) {}
 };
 WRITE_CLASS_ENCODER(RGWBucketInfo)
 
@@ -1044,6 +1070,8 @@ struct req_state {
 
    string region_endpoint;
    string bucket_instance_id;
+
+   string redirect;
 
    RGWBucketInfo bucket_info;
    map<string, bufferlist> bucket_attrs;
