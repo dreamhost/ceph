@@ -312,7 +312,12 @@ protected:
 public:
   RGWHandler_ObjStore() {}
   virtual ~RGWHandler_ObjStore() {}
+  int init_permissions();
   int read_permissions(RGWOp *op);
+  virtual int retarget(RGWOp *op, RGWOp **new_op) {
+    *new_op = op;
+    return 0;
+  }
 
   virtual int authorize() = 0;
 };
@@ -320,6 +325,7 @@ public:
 class RGWHandler_ObjStore_SWIFT;
 class RGWHandler_SWIFT_Auth;
 class RGWHandler_ObjStore_S3;
+
 
 class RGWRESTMgr {
   bool should_log;
@@ -375,7 +381,8 @@ extern void end_header(struct req_state *s,
                        RGWOp *op = NULL,
                        const char *content_type = NULL,
                        const int64_t proposed_content_length = NO_CONTENT_LENGTH,
-		       bool force_content_type = false);
+		       bool force_content_type = false,
+		       bool force_no_error = false);
 extern void dump_start(struct req_state *s);
 extern void list_all_buckets_start(struct req_state *s);
 extern void dump_owner(struct req_state *s, rgw_user& id, string& name, const char *section = NULL);
@@ -385,7 +392,7 @@ extern void dump_etag(struct req_state *s, const char *etag);
 extern void dump_epoch_header(struct req_state *s, const char *name, time_t t);
 extern void dump_time_header(struct req_state *s, const char *name, time_t t);
 extern void dump_last_modified(struct req_state *s, time_t t);
-extern void abort_early(struct req_state *s, RGWOp *op, int err);
+extern void abort_early(struct req_state *s, RGWOp *op, int err, RGWHandler* handler);
 extern void dump_range(struct req_state *s, uint64_t ofs, uint64_t end, uint64_t total_size);
 extern void dump_continue(struct req_state *s);
 extern void list_all_buckets_end(struct req_state *s);
