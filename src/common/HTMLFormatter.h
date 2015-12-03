@@ -15,7 +15,7 @@
 #include <map>
 
 #include "include/buffer.h"
-#include "XMLFormatter.h"
+#include "Formatter.h"
 
 namespace ceph {
   class HTMLFormatter : public XMLFormatter {

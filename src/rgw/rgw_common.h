@@ -266,7 +266,6 @@ class RGWHTTPArgs
   bool has_resp_modifier;
  public:
   RGWHTTPArgs() : has_resp_modifier(false) {}
-
   /** Set the arguments; as received */
   void set(string s) {
     has_resp_modifier = false;

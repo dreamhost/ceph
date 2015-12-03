@@ -19,7 +19,7 @@
 #include "assert.h"
 #include "Formatter.h"
 #include "HTMLFormatter.h"
-#include "XMLFormatter.h"
+#include "Formatter.h"
 #include "common/escape.h"
 
 #include <iostream>
