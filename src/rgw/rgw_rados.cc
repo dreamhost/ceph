@@ -7447,6 +7447,10 @@ int RGWRados::Object::complete_atomic_modification()
   cls_rgw_obj_chain chain;
   store->update_gc_chain(obj, state->manifest, &chain);
 
+  if (chain.empty()) {
+    return 0;
+  }
+
   string tag = state->obj_tag.to_str();
   int ret = store->gc->send_chain(chain, tag, false);  // do it async
 
@@ -9062,13 +9066,7 @@ int RGWRados::get_system_obj(RGWObjectCtx& obj_ctx, RGWRados::SystemObject::Read
   uint64_t len;
   ObjectReadOperation op;
 
-  RGWObjState *astate = NULL;
-
   get_obj_bucket_and_oid_loc(obj, bucket, oid, key);
-
-  int r = get_system_obj_state(&obj_ctx, obj, &astate, NULL);
-  if (r < 0)
-    return r;
 
   if (end < 0)
     len = 0;
@@ -9087,7 +9085,7 @@ int RGWRados::get_system_obj(RGWObjectCtx& obj_ctx, RGWRados::SystemObject::Read
   }
 
   librados::IoCtx *io_ctx;
-  r = read_state.get_ioctx(this, obj, &io_ctx);
+  int r = read_state.get_ioctx(this, obj, &io_ctx);
   if (r < 0) {
     ldout(cct, 20) << "get_ioctx() on obj=" << obj << " returned " << r << dendl;
     return r;
