@@ -5,19 +5,20 @@ import os
 import time
 
 from nose import with_setup, SkipTest
-from nose.tools import eq_ as eq, assert_raises
+from nose.tools import eq_ as eq, assert_raises, assert_not_equal
 from rados import (Rados,
                    LIBRADOS_OP_FLAG_FADVISE_DONTNEED,
                    LIBRADOS_OP_FLAG_FADVISE_NOCACHE,
                    LIBRADOS_OP_FLAG_FADVISE_RANDOM)
 from rbd import (RBD, Image, ImageNotFound, InvalidArgument, ImageExists,
                  ImageBusy, ImageHasSnapshots, ReadOnlyImage,
-                 FunctionNotSupported, ArgumentOutOfRange,
+                 FunctionNotSupported, ArgumentOutOfRange, ConnectionShutdown,
                  RBD_FEATURE_LAYERING, RBD_FEATURE_STRIPINGV2,
                  RBD_FEATURE_EXCLUSIVE_LOCK, RBD_FEATURE_JOURNALING,
                  RBD_MIRROR_MODE_DISABLED, RBD_MIRROR_MODE_IMAGE,
                  RBD_MIRROR_MODE_POOL, RBD_MIRROR_IMAGE_ENABLED,
-                 RBD_MIRROR_IMAGE_DISABLED, MIRROR_IMAGE_STATUS_STATE_UNKNOWN)
+                 RBD_MIRROR_IMAGE_DISABLED, MIRROR_IMAGE_STATUS_STATE_UNKNOWN,
+                 RBD_LOCK_MODE_EXCLUSIVE)
 
 rados = None
 ioctx = None
@@ -190,14 +191,14 @@ def test_create_defaults():
     check_default_params(2, 20, RBD_FEATURE_STRIPINGV2, 1, 1 << 16)
     check_default_params(2, 20, RBD_FEATURE_STRIPINGV2, 10, 1 << 20)
     check_default_params(2, 20, RBD_FEATURE_STRIPINGV2, 10, 1 << 16)
-    check_default_params(2, 20, RBD_FEATURE_STRIPINGV2, 0, 0)
+    check_default_params(2, 20, 0, 0, 0)
     # make sure invalid combinations of stripe unit and order are still invalid
     check_default_params(2, 22, RBD_FEATURE_STRIPINGV2, 10, 1 << 50, exception=InvalidArgument)
     check_default_params(2, 22, RBD_FEATURE_STRIPINGV2, 10, 100, exception=InvalidArgument)
     check_default_params(2, 22, RBD_FEATURE_STRIPINGV2, 0, 1, exception=InvalidArgument)
     check_default_params(2, 22, RBD_FEATURE_STRIPINGV2, 1, 0, exception=InvalidArgument)
     # 0 stripe unit and count are still ignored
-    check_default_params(2, 22, RBD_FEATURE_STRIPINGV2, 0, 0)
+    check_default_params(2, 22, 0, 0, 0)
 
 def test_context_manager():
     with Rados(conffile='') as cluster:
@@ -314,6 +315,13 @@ class TestImage(object):
         eq(image.stripe_count(), stripe_count)
         image.close()
         RBD().remove(ioctx, image_name)
+
+    @require_new_format()
+    def test_id(self):
+        assert_not_equal(b'', self.image.id())
+
+    def test_block_name_prefix(self):
+        assert_not_equal(b'', self.image.block_name_prefix())
 
     def test_invalidate_cache(self):
         self.image.write(b'abc', 0)
@@ -1154,6 +1162,45 @@ class TestExclusiveLock(object):
             for offset in [0, IMG_SIZE // 2]:
                 read = image2.read(offset, 256)
                 eq(data, read)
+    def test_acquire_release_lock(self):
+        with Image(ioctx, image_name) as image:
+            image.lock_acquire(RBD_LOCK_MODE_EXCLUSIVE)
+            image.lock_release()
+
+    def test_break_lock(self):
+        blacklist_rados = Rados(conffile='')
+        blacklist_rados.connect()
+        try:
+            blacklist_ioctx = blacklist_rados.open_ioctx(pool_name)
+            try:
+                rados2.conf_set('rbd_blacklist_on_break_lock', 'true')
+                with Image(ioctx2, image_name) as image, \
+                     Image(blacklist_ioctx, image_name) as blacklist_image:
+                    blacklist_image.lock_acquire(RBD_LOCK_MODE_EXCLUSIVE)
+                    assert_raises(ReadOnlyImage, image.lock_acquire,
+                                  RBD_LOCK_MODE_EXCLUSIVE)
+
+                    lock_owners = list(image.lock_get_owners())
+                    eq(1, len(lock_owners))
+                    eq(RBD_LOCK_MODE_EXCLUSIVE, lock_owners[0]['mode'])
+                    image.lock_break(RBD_LOCK_MODE_EXCLUSIVE,
+                                     lock_owners[0]['owner'])
+
+                    blacklist_rados.wait_for_latest_osdmap()
+                    data = rand_data(256)
+                    assert_raises(ConnectionShutdown,
+                                  blacklist_image.write, data, 0)
+
+                    image.lock_acquire(RBD_LOCK_MODE_EXCLUSIVE)
+
+                    try:
+                        blacklist_image.close()
+                    except ConnectionShutdown:
+                        pass
+            finally:
+                blacklist_ioctx.close()
+        finally:
+            blacklist_rados.shutdown()
 
 class TestMirroring(object):
 

@@ -250,6 +250,10 @@ void _usage()
   cout << "   --caps=<caps>             list of caps (e.g., \"usage=read, write; user=read\"\n";
   cout << "   --yes-i-really-mean-it    required for certain operations\n";
   cout << "   --reset-regions           reset regionmap when regionmap update\n";
+  cout << "   --bypass-gc               when specified with bucket deletion, triggers\n";
+  cout << "                             object deletions by not involving GC\n";
+  cout << "   --inconsistent-index      when specified with bucket deletion and bypass-gc set to true,\n";
+  cout << "                             ignores bucket index consistency\n";
   cout << "\n";
   cout << "<date> := \"YYYY-MM-DD[ hh:mm:ss]\"\n";
   cout << "\nQuota options:\n";
@@ -1751,18 +1755,18 @@ static void get_md_sync_status(list<string>& status)
   }
 
   map<int, RGWMetadataLogInfo> master_shards_info;
-  string master_period;
+  string master_period = store->get_current_period_id();
 
-  ret = sync.read_master_log_shards_info(&master_period, &master_shards_info);
+  ret = sync.read_master_log_shards_info(master_period, &master_shards_info);
   if (ret < 0) {
     status.push_back(string("failed to fetch master sync status: ") + cpp_strerror(-ret));
     return;
   }
 
   map<int, string> shards_behind;
-
   if (sync_status.sync_info.period != master_period) {
-    status.push_back(string("master is on a different period: master_period=" + master_period + " local_period=" + sync_status.sync_info.period));
+    status.push_back(string("master is on a different period: master_period=" +
+                            master_period + " local_period=" + sync_status.sync_info.period));
   } else {
     for (auto local_iter : sync_status.sync_markers) {
       int shard_id = local_iter.first;
@@ -1782,7 +1786,7 @@ static void get_md_sync_status(list<string>& status)
 
   int total_behind = shards_behind.size() + (sync_status.sync_info.num_shards - num_inc);
   if (total_behind == 0) {
-    status.push_back("metadata is caught up with master");
+    push_ss(ss, status) << "metadata is caught up with master";
   } else {
     push_ss(ss, status) << "metadata is behind on " << total_behind << " shards";
 
@@ -2281,6 +2285,8 @@ int main(int argc, char **argv)
 
   int sync_stats = false;
   int reset_regions = false;
+  int bypass_gc = false;
+  int inconsistent_index = false;
 
   int verbose = false;
 
@@ -2506,7 +2512,10 @@ int main(int argc, char **argv)
      // do nothing
     } else if (ceph_argparse_binary_flag(args, i, &extra_info, NULL, "--extra-info", (char*)NULL)) {
      // do nothing
-    } else if (ceph_argparse_binary_flag(args, i, &reset_regions, NULL, "--reset-regions", (char*)NULL)) {
+    } else if (ceph_argparse_binary_flag(args, i, &bypass_gc, NULL, "--bypass-gc", (char*)NULL)) {
+     // do nothing
+    } else if (ceph_argparse_binary_flag(args, i, &inconsistent_index, NULL, "--inconsistent-index", (char*)NULL)) {
+     // do nothing
     } else if (ceph_argparse_witharg(args, i, &val, "--caps", (char*)NULL)) {
       caps = val;
     } else if (ceph_argparse_witharg(args, i, &val, "-i", "--infile", (char*)NULL)) {
@@ -2944,7 +2953,7 @@ int main(int argc, char **argv)
 	  cerr << "failed to list realmss: " << cpp_strerror(-ret) << std::endl;
 	  return -ret;
 	}
-	formatter->open_object_section("realmss_list");
+	formatter->open_object_section("realms_list");
 	encode_json("default_info", default_id, formatter);
 	encode_json("realms", realms, formatter);
 	formatter->close_section();
@@ -3002,24 +3011,39 @@ int main(int argc, char **argv)
 	  cerr << "no realm name or id provided" << std::endl;
 	  return -EINVAL;
 	}
-        if (infile.empty()) {
-	  cerr << "no realm input file provided" << std::endl;
-	  return -EINVAL;
-        }
 	RGWRealm realm(realm_id, realm_name);
-	int ret = realm.init(g_ceph_context, store, false);
-	if (ret < 0) {
+	bool new_realm = false;
+	int ret = realm.init(g_ceph_context, store);
+	if (ret < 0 && ret != -ENOENT) {
 	  cerr << "failed to init realm: " << cpp_strerror(-ret) << std::endl;
 	  return -ret;
+	} else if (ret == -ENOENT) {
+	  new_realm = true;
 	}
 	ret = read_decode_json(infile, realm);
 	if (ret < 0) {
 	  return 1;
 	}
-	ret = realm.update();
-	if (ret < 0) {
-	  cerr << "ERROR: couldn't store realm info: " << cpp_strerror(-ret) << std::endl;
-	  return 1;
+	if (!realm_name.empty() && realm.get_name() != realm_name) {
+	  cerr << "mismatch between --rgw-realm " << realm_name << " and json input file name " <<
+	    realm.get_name() << std::endl;
+	  return EINVAL;
+	}
+	/* new realm */
+	if (new_realm) {
+	  cout << "clearing period and epoch for new realm" << std::endl;
+	  realm.clear_current_period_and_epoch();
+	  ret = realm.create();
+	  if (ret < 0) {
+	    cerr << "ERROR: couldn't create new realm: " << cpp_strerror(-ret) << std::endl;
+	    return 1;
+	  }
+	} else {
+	  ret = realm.update();
+	  if (ret < 0) {
+	    cerr << "ERROR: couldn't store realm info: " << cpp_strerror(-ret) << std::endl;
+	    return 1;
+	  }
 	}
 
         if (set_default) {
@@ -4140,6 +4164,7 @@ int main(int argc, char **argv)
   bucket_op.set_check_objects(check_objects);
   bucket_op.set_delete_children(delete_child_objects);
   bucket_op.set_fix_index(fix);
+  bucket_op.set_max_aio(max_concurrent_ios);
 
   // required to gather errors from operations
   std::string err_msg;
@@ -4542,7 +4567,7 @@ int main(int argc, char **argv)
         formatter->open_array_section("log_entries");
 
       do {
-	uint64_t total_time =  entry.total_time.sec() * 1000000LL * entry.total_time.usec();
+	uint64_t total_time =  entry.total_time.sec() * 1000000LL + entry.total_time.usec();
 
         agg_time += total_time;
         agg_bytes_sent += entry.bytes_sent;
@@ -5302,7 +5327,11 @@ next:
   }
 
   if (opt_cmd == OPT_BUCKET_RM) {
-    RGWBucketAdminOp::remove_bucket(store, bucket_op);
+    if (inconsistent_index == false) {
+      RGWBucketAdminOp::remove_bucket(store, bucket_op, bypass_gc, true);
+    } else {
+      RGWBucketAdminOp::remove_bucket(store, bucket_op, bypass_gc, false);
+    }
   }
 
   if (opt_cmd == OPT_GC_LIST) {

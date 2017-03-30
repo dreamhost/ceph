@@ -1,4 +1,3 @@
-
 // -*- mode:C++; tab-width:8; c-basic-offset:2; indent-tabs-mode:t -*-
 // vim: ts=8 sw=2 smarttab
 
@@ -386,8 +385,8 @@ int RGWSystemMetaObj::init(CephContext *_cct, RGWRados *_store, bool setup_obj, 
     } else if (!old_format) {
       r = read_id(name, id);
       if (r < 0) {
-	ldout(cct, 0) << "error in read_id for id " << id << " : " << cpp_strerror(-r) << dendl;
-	return r;
+        ldout(cct, 0) << "error in read_id for object name: " << name << " : " << cpp_strerror(-r) << dendl;
+        return r;
       }
     }
   }
@@ -3240,9 +3239,9 @@ int RGWRados::convert_regionmap()
 {
   RGWZoneGroupMap zonegroupmap;
 
-  string pool_name = cct->_conf->rgw_zone_root_pool;
+  string pool_name = cct->_conf->rgw_region_root_pool;
   if (pool_name.empty()) {
-    pool_name = RGW_DEFAULT_ZONE_ROOT_POOL;
+    pool_name = RGW_DEFAULT_ZONEGROUP_ROOT_POOL;
   }
   string oid = region_map_oid; 
 
@@ -3571,7 +3570,7 @@ int RGWRados::init_zg_from_period(bool *initialized)
     return 0;
   }
   if (ret < 0) {
-    ldout(cct, 0) << "failed reading zonegroup info: " << " " << cpp_strerror(-ret) << dendl;
+    ldout(cct, 0) << "failed reading zonegroup info: " << cpp_strerror(-ret) << dendl;
     return ret;
   }
   ldout(cct, 20) << "period zonegroup name " << zonegroup.get_name() << dendl;
@@ -3582,10 +3581,23 @@ int RGWRados::init_zg_from_period(bool *initialized)
   if (iter != current_period.get_map().zonegroups.end()) {
     ldout(cct, 20) << "using current period zonegroup " << zonegroup.get_name() << dendl;
     zonegroup = iter->second;
+    ret = zonegroup.init(cct, this, false);
+    if (ret < 0) {
+      ldout(cct, 0) << "failed init zonegroup: " << " " << cpp_strerror(-ret) << dendl;
+      return ret;
+    }
     ret = zone_params.init(cct, this);
     if (ret < 0 && ret != -ENOENT) {
       ldout(cct, 0) << "failed reading zone params info: " << " " << cpp_strerror(-ret) << dendl;
       return ret;
+    } if (ret ==-ENOENT && zonegroup.get_name() == default_zonegroup_name) {
+      ldout(cct, 10) << " Using default name "<< default_zone_name << dendl;
+      zone_params.set_name(default_zone_name);
+      ret = zone_params.init(cct, this);
+      if (ret < 0 && ret != -ENOENT) {
+       ldout(cct, 0) << "failed reading zone params info: " << " " << cpp_strerror(-ret) << dendl;
+       return ret;
+      }
     }
   }
   for (iter = current_period.get_map().zonegroups.begin();
@@ -3601,7 +3613,11 @@ int RGWRados::init_zg_from_period(bool *initialized)
 	  master->second.name << " id:" << master->second.id << " as master" << dendl;
 	if (zonegroup.get_id() == zg.get_id()) {
 	  zonegroup.master_zone = master->second.id;
-	  zonegroup.update();
+	  ret = zonegroup.update();
+	  if (ret < 0) {
+	    ldout(cct, 0) << "error updating zonegroup : " << cpp_strerror(-ret) << dendl;
+	    return ret;
+	  }
 	} else {
 	  RGWZoneGroup fixed_zg(zg.get_id(),zg.get_name());
 	  ret = fixed_zg.init(cct, this);
@@ -3610,7 +3626,11 @@ int RGWRados::init_zg_from_period(bool *initialized)
 	    return ret;
 	  }
 	  fixed_zg.master_zone = master->second.id;
-	  fixed_zg.update();
+	  ret = fixed_zg.update();
+	  if (ret < 0) {
+	    ldout(cct, 0) << "error initializing zonegroup : " << cpp_strerror(-ret) << dendl;
+	    return ret;
+	  }
 	}
       } else {
 	ldout(cct, 0) << "zonegroup " << zg.get_name() << " missing zone for master_zone=" <<
@@ -3664,7 +3684,11 @@ int RGWRados::init_zg_from_local(bool *creating_defaults)
 	ldout(cct, 0) << "zonegroup " << zonegroup.get_name() << " missing master_zone, setting zone " <<
 	  master->second.name << " id:" << master->second.id << " as master" << dendl;
 	zonegroup.master_zone = master->second.id;
-	zonegroup.update();
+	ret = zonegroup.update();
+	if (ret < 0) {
+	  ldout(cct, 0) << "error initializing zonegroup : " << cpp_strerror(-ret) << dendl;
+	  return ret;
+	}
       } else {
 	ldout(cct, 0) << "zonegroup " << zonegroup.get_name() << " missing zone for "
           "master_zone=" << zonegroup.master_zone << dendl;
@@ -3821,6 +3845,13 @@ int RGWRados::init_complete()
   if (use_gc_thread) {
     gc->start_processor();
     obj_expirer->start_processor();
+  }
+
+  if (run_sync_thread) {
+    // initialize the log period history. we want to do this any time we're not
+    // running under radosgw-admin, so we check run_sync_thread here before
+    // disabling it based on the zone/zonegroup setup
+    meta_mgr->init_oldest_log_period();
   }
 
   /* not point of running sync thread if there is a single zone or
@@ -4913,21 +4944,20 @@ int RGWRados::Bucket::List::list_objects(int max, vector<RGWObjEnt> *result,
 
   result->clear();
 
-  rgw_obj marker_obj, end_marker_obj, prefix_obj;
-  marker_obj.set_instance(params.marker.instance);
-  marker_obj.set_ns(params.ns);
-  marker_obj.set_obj(params.marker.name);
+  rgw_bucket b;
+  rgw_obj marker_obj(b, params.marker);
+  rgw_obj end_marker_obj(b, params.end_marker);
+  rgw_obj prefix_obj;
+  rgw_obj_key cur_end_marker;
+  if (!params.ns.empty()) {
+    marker_obj.set_ns(params.ns);
+    end_marker_obj.set_ns(params.ns);
+    end_marker_obj.get_index_key(&cur_end_marker);
+  }
   rgw_obj_key cur_marker;
   marker_obj.get_index_key(&cur_marker);
 
-  end_marker_obj.set_instance(params.end_marker.instance);
-  end_marker_obj.set_ns(params.ns);
-  end_marker_obj.set_obj(params.end_marker.name);
-  rgw_obj_key cur_end_marker;
-  if (params.ns.empty()) { /* no support for end marker for namespaced objects */
-    end_marker_obj.get_index_key(&cur_end_marker);
-  }
-  const bool cur_end_marker_valid = !cur_end_marker.empty();
+  const bool cur_end_marker_valid = !params.end_marker.empty();
 
   prefix_obj.set_ns(params.ns);
   prefix_obj.set_obj(params.prefix);
@@ -5006,8 +5036,8 @@ int RGWRados::Bucket::List::list_objects(int max, vector<RGWObjEnt> *result,
       }
 
       if (count < max) {
-        params.marker = obj;
-        next_marker = obj;
+        params.marker = key;
+        next_marker = key;
       }
 
       if (params.filter && !params.filter->filter(obj.name, key.name))
@@ -6473,7 +6503,7 @@ int RGWRados::aio_put_obj_data(void *ctx, rgw_obj& obj, bufferlist& bl,
 int RGWRados::aio_wait(void *handle)
 {
   AioCompletion *c = (AioCompletion *)handle;
-  c->wait_for_complete();
+  c->wait_for_safe();
   int ret = c->get_return_value();
   c->release();
   return ret;
@@ -6482,7 +6512,7 @@ int RGWRados::aio_wait(void *handle)
 bool RGWRados::aio_completed(void *handle)
 {
   AioCompletion *c = (AioCompletion *)handle;
-  return c->is_complete();
+  return c->is_safe();
 }
 
 class RGWRadosPutObj : public RGWGetDataCB
@@ -8318,7 +8348,7 @@ int RGWRados::Object::Stat::wait()
     return state.ret;
   }
 
-  state.completion->wait_for_complete();
+  state.completion->wait_for_safe();
   state.ret = state.completion->get_return_value();
   state.completion->release();
 
@@ -9263,7 +9293,7 @@ struct get_obj_data : public RefCountedObject {
     librados::AioCompletion *c = iter->second;
     lock.Unlock();
 
-    c->wait_for_complete_and_cb();
+    c->wait_for_safe_and_cb();
     int r = c->get_return_value();
 
     lock.Lock();
@@ -9282,7 +9312,12 @@ struct get_obj_data : public RefCountedObject {
   void add_io(off_t ofs, off_t len, bufferlist **pbl, AioCompletion **pc) {
     Mutex::Locker l(lock);
 
-    get_obj_io& io = io_map[ofs];
+    const auto& io_iter = io_map.insert(
+      map<off_t, get_obj_io>::value_type(ofs, get_obj_io()));
+
+    assert(io_iter.second); // assert new insertion
+
+    get_obj_io& io = (io_iter.first)->second;
     *pbl = &io.bl;
 
     struct get_obj_aio_data aio;
@@ -9294,7 +9329,7 @@ struct get_obj_data : public RefCountedObject {
 
     struct get_obj_aio_data *paio_data =  &aio_data.back(); /* last element */
 
-    librados::AioCompletion *c = librados::Rados::aio_create_completion((void *)paio_data, _get_obj_aio_completion_cb, NULL);
+    librados::AioCompletion *c = librados::Rados::aio_create_completion((void *)paio_data, NULL, _get_obj_aio_completion_cb);
     completion_map[ofs] = c;
 
     *pc = c;
@@ -9356,7 +9391,7 @@ struct get_obj_data : public RefCountedObject {
 
     for (; aiter != completion_map.end(); ++aiter) {
       completion = aiter->second;
-      if (!completion->is_complete()) {
+      if (!completion->is_safe()) {
         /* reached a request that is not yet complete, stop */
         break;
       }
@@ -9529,9 +9564,10 @@ int RGWRados::get_obj_iterate_cb(RGWObjectCtx *ctx, RGWObjState *astate,
   io_ctx.locator_set_key(key);
 
   r = io_ctx.aio_operate(oid, c, &op, NULL);
-  ldout(cct, 20) << "rados->aio_operate r=" << r << " bl.length=" << pbl->length() << dendl;
-  if (r < 0)
-    goto done_err;
+  if (r < 0) {
+	ldout(cct, 0) << "rados->aio_operate r=" << r << dendl;
+	goto done_err;
+  }
 
   // Flush data to client if there is any
   r = flush_read_list(d);
@@ -12549,5 +12585,50 @@ librados::Rados* RGWRados::get_rados_handle()
       return &rados[handle];
     }
   }
+}
+
+int RGWRados::delete_obj_aio(rgw_obj& obj, rgw_bucket& bucket,
+                             RGWBucketInfo& bucket_info, RGWObjState *astate,
+                             list<librados::AioCompletion *>& handles, bool keep_index_consistent)
+{
+  rgw_rados_ref ref;
+  int ret = get_obj_ref(obj, &ref, &bucket);
+  if (ret < 0) {
+    lderr(cct) << "ERROR: failed to get obj ref with ret=" << ret << dendl;
+    return ret;
+  }
+
+  if (keep_index_consistent) {
+    RGWRados::Bucket bop(this, bucket_info);
+    RGWRados::Bucket::UpdateIndex index_op(&bop, obj, astate);
+
+    ret = index_op.prepare(CLS_RGW_OP_DEL);
+    if (ret < 0) {
+      lderr(cct) << "ERROR: failed to prepare index op with ret=" << ret << dendl;
+      return ret;
+    }
+  }
+
+  ObjectWriteOperation op;
+  list<string> prefixes;
+  cls_rgw_remove_obj(op, prefixes);
+
+  AioCompletion *c = librados::Rados::aio_create_completion(NULL, NULL, NULL);
+  ret = ref.ioctx.aio_operate(ref.oid, c, &op);
+  if (ret < 0) {
+    lderr(cct) << "ERROR: AioOperate failed with ret=" << ret << dendl;
+    return ret;
+  }
+
+  handles.push_back(c);
+
+  if (keep_index_consistent) {
+    ret = delete_obj_index(obj);
+    if (ret < 0) {
+      lderr(cct) << "ERROR: failed to delete obj index with ret=" << ret << dendl;
+      return ret;
+    }
+  }
+  return ret;
 }
 

@@ -268,7 +268,12 @@ class Error(Exception):
 
     def __str__(self):
         doc = _bytes2str(self.__doc__.strip())
-        return ': '.join([doc] + [_bytes2str(a) for a in self.args])
+        try:
+            str_type = basestring
+        except NameError:
+            str_type = str
+        args = [a if isinstance(a, str_type) else str(a) for a in self.args]
+        return ': '.join([doc] + [_bytes2str(a) for a in args])
 
 
 class MountError(Error):
@@ -1386,16 +1391,22 @@ def check_journal_reqs(args):
         'ceph-osd', '--check-allows-journal',
         '-i', '0',
         '--cluster', args.cluster,
+        '--setuser', get_ceph_user(),
+        '--setgroup', get_ceph_group(),
     ])
     _, _, wants_journal = command([
         'ceph-osd', '--check-wants-journal',
         '-i', '0',
         '--cluster', args.cluster,
+        '--setuser', get_ceph_user(),
+        '--setgroup', get_ceph_group(),
     ])
     _, _, needs_journal = command([
         'ceph-osd', '--check-needs-journal',
         '-i', '0',
         '--cluster', args.cluster,
+        '--setuser', get_ceph_user(),
+        '--setgroup', get_ceph_group(),
     ])
     return (not allows_journal, not wants_journal, not needs_journal)
 
@@ -2897,10 +2908,19 @@ def start_daemon(
                 ],
             )
         elif os.path.exists(os.path.join(path, 'systemd')):
+            # ensure there is no duplicate ceph-osd@.service
+            command_check_call(
+                [
+                    'systemctl',
+                    'disable',
+                    'ceph-osd@{osd_id}'.format(osd_id=osd_id),
+                ],
+            )
             command_check_call(
                 [
                     'systemctl',
                     'enable',
+                    '--runtime',
                     'ceph-osd@{osd_id}'.format(osd_id=osd_id),
                 ],
             )
@@ -2958,6 +2978,7 @@ def stop_daemon(
                 [
                     'systemctl',
                     'disable',
+                    '--runtime',
                     'ceph-osd@{osd_id}'.format(osd_id=osd_id),
                 ],
             )
@@ -4317,6 +4338,8 @@ def main_trigger(args):
         )
         return
 
+    if get_ceph_user() == 'ceph':
+        command_check_call(['chown', 'ceph:ceph', args.dev])
     parttype = get_partition_type(args.dev)
     partid = get_partition_uuid(args.dev)
 
