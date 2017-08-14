@@ -440,10 +440,10 @@ namespace rgw {
     def_args.push_back("--keyring=$rgw_data/keyring");
     def_args.push_back("--log-file=/var/log/radosgw/$cluster-$name.log");
 
-    global_init(&def_args, args,
-		CEPH_ENTITY_TYPE_CLIENT,
-		CODE_ENVIRONMENT_DAEMON,
-		CINIT_FLAG_UNPRIVILEGED_DAEMON_DEFAULTS);
+    cct = global_init(&def_args, args,
+		      CEPH_ENTITY_TYPE_CLIENT,
+		      CODE_ENVIRONMENT_DAEMON,
+		      CINIT_FLAG_UNPRIVILEGED_DAEMON_DEFAULTS);
 
     Mutex mutex("main");
     SafeTimer init_timer(g_ceph_context, mutex);
@@ -550,7 +550,7 @@ namespace rgw {
     rgw_perf_stop(g_ceph_context);
 
     dout(1) << "final shutdown" << dendl;
-    g_ceph_context->put();
+    cct.reset();
 
     ceph::crypto::shutdown();
 
@@ -629,7 +629,18 @@ int librgw_create(librgw_t* rgw, int argc, char **argv)
     std::lock_guard<std::mutex> lg(librgw_mtx);
     if (! g_ceph_context) {
       vector<const char*> args;
+      std::vector<std::string> spl_args;
+      // last non-0 argument will be split and consumed
+      if (argc > 1) {
+	const std::string spl_arg{argv[(--argc)]};
+	get_str_vec(spl_arg, " \t", spl_args);
+      }
       argv_to_vec(argc, const_cast<const char**>(argv), args);
+      // append split args, if any
+      for (const auto& elt : spl_args) {
+	args.push_back(elt.c_str());
+      }
+      env_to_vec(args);
       rc = rgwlib.init(args);
     }
   }

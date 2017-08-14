@@ -2102,6 +2102,19 @@ void Client::handle_client_session(MClientSession *m)
   m->put();
 }
 
+bool Client::_any_stale_sessions() const
+{
+  assert(client_lock.is_locked_by_me());
+
+  for (const auto &i : mds_sessions) {
+    if (i.second->state == MetaSession::STATE_STALE) {
+      return true;
+    }
+  }
+
+  return false;
+}
+
 void Client::_kick_stale_sessions()
 {
   ldout(cct, 1) << "kick_stale_sessions" << dendl;
@@ -3258,6 +3271,19 @@ void Client::send_cap(Inode *in, MetaSession *session, Cap *cap,
   session->con->send_message(m);
 }
 
+static bool is_max_size_approaching(Inode *in)
+{
+  /* mds will adjust max size according to the reported size */
+  if (in->flushing_caps & CEPH_CAP_FILE_WR)
+    return false;
+  if (in->size >= in->max_size)
+    return true;
+  /* half of previous max_size increment has been used */
+  if (in->max_size > in->reported_size &&
+      (in->size << 1) >= in->max_size + in->reported_size)
+    return true;
+  return false;
+}
 
 void Client::check_caps(Inode *in, bool is_delayed)
 {
@@ -3339,11 +3365,10 @@ void Client::check_caps(Inode *in, bool is_delayed)
 
     /* approaching file_max? */
     if ((cap->issued & CEPH_CAP_FILE_WR) &&
-	(in->size << 1) >= in->max_size &&
-	(in->reported_size << 1) < in->max_size &&
-	cap == in->auth_cap) {
+	cap == in->auth_cap &&
+	is_max_size_approaching(in)) {
       ldout(cct, 10) << "size " << in->size << " approaching max_size " << in->max_size
-	       << ", reported " << in->reported_size << dendl;
+		     << ", reported " << in->reported_size << dendl;
       goto ack;
     }
 
@@ -7543,11 +7568,11 @@ int Client::getdir(const char *relpath, list<string>& contents)
 int Client::open(const char *relpath, int flags, mode_t mode, int stripe_unit,
     int stripe_count, int object_size, const char *data_pool)
 {
-  ldout(cct, 3) << "open enter(" << relpath << ", " << flags << "," << mode << ") = " << dendl;
+  ldout(cct, 3) << "open enter(" << relpath << ", " << ceph_flags_sys2wire(flags) << "," << mode << ") = " << dendl;
   Mutex::Locker lock(client_lock);
   tout(cct) << "open" << std::endl;
   tout(cct) << relpath << std::endl;
-  tout(cct) << flags << std::endl;
+  tout(cct) << ceph_flags_sys2wire(flags) << std::endl;
 
   uid_t uid = get_uid();
   gid_t gid = get_gid();
@@ -7619,7 +7644,7 @@ int Client::open(const char *relpath, int flags, mode_t mode, int stripe_unit,
   
  out:
   tout(cct) << r << std::endl;
-  ldout(cct, 3) << "open exit(" << path << ", " << flags << ") = " << r << dendl;
+  ldout(cct, 3) << "open exit(" << path << ", " << ceph_flags_sys2wire(flags) << ") = " << r << dendl;
   return r;
 }
 
@@ -7820,7 +7845,8 @@ void Client::_put_fh(Fh *f)
 
 int Client::_open(Inode *in, int flags, mode_t mode, Fh **fhp, int uid, int gid)
 {
-  int cmode = ceph_flags_to_mode(flags);
+  // use normalized flags to generate cmode
+  int cmode = ceph_flags_to_mode(ceph_flags_sys2wire(flags));
   if (cmode < 0)
     return -EINVAL;
   int want = ceph_caps_for_mode(cmode);
@@ -7841,8 +7867,8 @@ int Client::_open(Inode *in, int flags, mode_t mode, Fh **fhp, int uid, int gid)
     MetaRequest *req = new MetaRequest(CEPH_MDS_OP_OPEN);
     filepath path;
     in->make_nosnap_relative_path(path);
-    req->set_filepath(path); 
-    req->head.args.open.flags = flags & ~O_CREAT;
+    req->set_filepath(path);
+    req->head.args.open.flags = ceph_flags_sys2wire(flags & ~O_CREAT);
     req->head.args.open.mode = mode;
     req->head.args.open.pool = -1;
     if (cct->_conf->client_debug_getattr_caps)
@@ -8620,10 +8646,8 @@ success:
 
     if (is_quota_bytes_approaching(in)) {
       check_caps(in, true);
-    } else {
-      if ((in->size << 1) >= in->max_size &&
-          (in->reported_size << 1) < in->max_size)
-        check_caps(in, false);
+    } else if (is_max_size_approaching(in)) {
+      check_caps(in, false);
     }
 
     ldout(cct, 7) << "wrote to " << totalwritten+offset << ", extending file size" << dendl;
@@ -8916,6 +8940,21 @@ int Client::statfs(const char *path, struct statvfs *stbuf)
   assert(cct->_conf->client_quota == false || quota_root != nullptr);
 
   if (quota_root && cct->_conf->client_quota_df && quota_root->quota.max_bytes) {
+
+    // Skip the getattr if any sessions are stale, as we don't want to
+    // block `df` if this client has e.g. been evicted, or if the MDS cluster
+    // is unhealthy.
+    if (!_any_stale_sessions()) {
+      int r = _getattr(quota_root, 0, -1, -1, true);
+      if (r != 0) {
+        // Ignore return value: error getting latest inode metadata is not a good
+        // reason to break "df".
+        lderr(cct) << "Error in getattr on quota root 0x"
+                   << std::hex << quota_root->ino << std::dec
+                   << " statfs result may be outdated" << dendl;
+      }
+    }
+
     // Special case: if there is a size quota set on the Inode acting
     // as the root for this client mount, then report the quota status
     // as the filesystem statistics.
@@ -9791,6 +9830,8 @@ int Client::fremovexattr(int fd, const char *name)
 
 int Client::setxattr(const char *path, const char *name, const void *value, size_t size, int flags)
 {
+  _setxattr_maybe_wait_for_osdmap(name, value, size);
+
   Mutex::Locker lock(client_lock);
   InodeRef in;
   int r = Client::path_walk(path, &in, true);
@@ -9801,6 +9842,8 @@ int Client::setxattr(const char *path, const char *name, const void *value, size
 
 int Client::lsetxattr(const char *path, const char *name, const void *value, size_t size, int flags)
 {
+  _setxattr_maybe_wait_for_osdmap(name, value, size);
+
   Mutex::Locker lock(client_lock);
   InodeRef in;
   int r = Client::path_walk(path, &in, false);
@@ -9811,6 +9854,8 @@ int Client::lsetxattr(const char *path, const char *name, const void *value, siz
 
 int Client::fsetxattr(int fd, const char *name, const void *value, size_t size, int flags)
 {
+  _setxattr_maybe_wait_for_osdmap(name, value, size);
+
   Mutex::Locker lock(client_lock);
   Fh *f = get_filehandle(fd);
   if (!f)
@@ -9827,10 +9872,21 @@ int Client::_getxattr(Inode *in, const char *name, void *value, size_t size,
   if (vxattr) {
     r = -ENODATA;
 
-    char buf[256];
+    // Do a force getattr to get the latest quota before returning
+    // a value to userspace.
+    r = _getattr(in, 0, uid, gid, true);
+    if (r != 0) {
+      // Error from getattr!
+      return r;
+    }
+
     // call pointer-to-member function
-    if (!(vxattr->exists_cb && !(this->*(vxattr->exists_cb))(in)))
+    char buf[256];
+    if (!(vxattr->exists_cb && !(this->*(vxattr->exists_cb))(in))) {
       r = (this->*(vxattr->getxattr_cb))(in, buf, sizeof(buf));
+    } else {
+      r = -ENODATA;
+    }
 
     if (size != 0) {
       if (r > (int)size) {
@@ -10055,7 +10111,7 @@ int Client::_setxattr(InodeRef &in, const char *name, const void *value,
   return _setxattr(in.get(), name, value, size, flags);
 }
 
-int Client::check_data_pool_exist(string name, string value, const OSDMap *osdmap)
+int Client::_setxattr_check_data_pool(string& name, string& value, const OSDMap *osdmap)
 {
   string tmp;
   if (name == "layout") {
@@ -10095,18 +10151,17 @@ int Client::check_data_pool_exist(string name, string value, const OSDMap *osdma
   return 0;
 }
 
-int Client::ll_setxattr(Inode *in, const char *name, const void *value,
-			size_t size, int flags, int uid, int gid)
+void Client::_setxattr_maybe_wait_for_osdmap(const char *name, const void *value, size_t size)
 {
   // For setting pool of layout, MetaRequest need osdmap epoch.
   // There is a race which create a new data pool but client and mds both don't have.
   // Make client got the latest osdmap which make mds quickly judge whether get newer osdmap.
-  if (strcmp(name, "ceph.file.layout.pool") == 0 ||  strcmp(name, "ceph.dir.layout.pool") == 0 ||
+  if (strcmp(name, "ceph.file.layout.pool") == 0 || strcmp(name, "ceph.dir.layout.pool") == 0 ||
       strcmp(name, "ceph.file.layout") == 0 || strcmp(name, "ceph.dir.layout") == 0) {
     string rest(strstr(name, "layout"));
-    string v((const char*)value);
+    string v((const char*)value, size);
     int r = objecter->with_osdmap([&](const OSDMap& o) {
-      return check_data_pool_exist(rest, v, &o);
+      return _setxattr_check_data_pool(rest, v, &o);
     });
 
     if (r == -ENOENT) {
@@ -10115,6 +10170,12 @@ int Client::ll_setxattr(Inode *in, const char *name, const void *value,
       ctx.wait();
     }
   }
+}
+
+int Client::ll_setxattr(Inode *in, const char *name, const void *value,
+			size_t size, int flags, int uid, int gid)
+{
+  _setxattr_maybe_wait_for_osdmap(name, value, size);
 
   Mutex::Locker lock(client_lock);
 
@@ -10540,7 +10601,8 @@ int Client::_create(Inode *dir, const char *name, int flags, mode_t mode,
     return -EDQUOT;
   }
 
-  int cmode = ceph_flags_to_mode(flags);
+  // use normalized flags to generate cmode
+  int cmode = ceph_flags_to_mode(ceph_flags_sys2wire(flags));
   if (cmode < 0)
     return -EINVAL;
 
@@ -10561,7 +10623,7 @@ int Client::_create(Inode *dir, const char *name, int flags, mode_t mode,
   path.push_dentry(name);
   req->set_filepath(path);
   req->set_inode(dir);
-  req->head.args.open.flags = flags | O_CREAT;
+  req->head.args.open.flags = ceph_flags_sys2wire(flags | O_CREAT);
 
   req->head.args.open.stripe_unit = stripe_unit;
   req->head.args.open.stripe_count = stripe_count;
@@ -10929,11 +10991,14 @@ int Client::_rename(Inode *fromdir, const char *fromname, Inode *todir, const ch
       return -EROFS;
   }
   if (cct->_conf->client_quota &&
-      fromdir != todir &&
-      (fromdir->quota.is_enable() ||
-       todir->quota.is_enable() ||
-       get_quota_root(fromdir) != get_quota_root(todir))) {
-    return -EXDEV;
+      fromdir != todir) {
+    Inode *fromdir_root =
+      fromdir->quota.is_enable() ? fromdir : get_quota_root(fromdir);
+    Inode *todir_root =
+      todir->quota.is_enable() ? todir : get_quota_root(todir);
+    if (fromdir_root != todir_root) {
+      return -EXDEV;
+    }
   }
 
   InodeRef target;
@@ -11262,10 +11327,10 @@ int Client::ll_open(Inode *in, int flags, Fh **fhp, int uid, int gid)
 
   vinodeno_t vino = _get_vino(in);
 
-  ldout(cct, 3) << "ll_open " << vino << " " << flags << dendl;
+  ldout(cct, 3) << "ll_open " << vino << " " << ceph_flags_sys2wire(flags) << dendl;
   tout(cct) << "ll_open" << std::endl;
   tout(cct) << vino.ino.val << std::endl;
-  tout(cct) << flags << std::endl;
+  tout(cct) << ceph_flags_sys2wire(flags) << std::endl;
 
   int r;
   if (uid < 0) {
@@ -11286,8 +11351,8 @@ int Client::ll_open(Inode *in, int flags, Fh **fhp, int uid, int gid)
     ll_unclosed_fh_set.insert(fhptr);
   }
   tout(cct) << (unsigned long)fhptr << std::endl;
-  ldout(cct, 3) << "ll_open " << vino << " " << flags << " = " << r << " (" <<
-    fhptr << ")" << dendl;
+  ldout(cct, 3) << "ll_open " << vino << " " << ceph_flags_sys2wire(flags) <<
+      " = " << r << " (" << fhptr << ")" << dendl;
   return r;
 }
 
@@ -11300,12 +11365,12 @@ int Client::ll_create(Inode *parent, const char *name, mode_t mode,
   vinodeno_t vparent = _get_vino(parent);
 
   ldout(cct, 3) << "ll_create " << vparent << " " << name << " 0" << oct <<
-    mode << dec << " " << flags << ", uid " << uid << ", gid " << gid << dendl;
+    mode << dec << " " << ceph_flags_sys2wire(flags)<< ", uid " << uid << ", gid " << gid << dendl;
   tout(cct) << "ll_create" << std::endl;
   tout(cct) << vparent.ino.val << std::endl;
   tout(cct) << name << std::endl;
   tout(cct) << mode << std::endl;
-  tout(cct) << flags << std::endl;
+  tout(cct) << ceph_flags_sys2wire(flags) << std::endl;
 
   bool created = false;
   InodeRef in;
@@ -11362,7 +11427,7 @@ out:
   tout(cct) << (unsigned long)fhptr << std::endl;
   tout(cct) << attr->st_ino << std::endl;
   ldout(cct, 3) << "ll_create " << parent << " " << name << " 0" << oct <<
-    mode << dec << " " << flags << " = " << r << " (" << fhptr << " " <<
+    mode << dec << " " << ceph_flags_sys2wire(flags) << " = " << r << " (" << fhptr << " " <<
     hex << attr->st_ino << dec << ")" << dendl;
 
   // passing an Inode in outp requires an additional ref
@@ -11681,10 +11746,8 @@ int Client::_fallocate(Fh *fh, int mode, int64_t offset, int64_t length)
 
       if (is_quota_bytes_approaching(in)) {
         check_caps(in, true);
-      } else {
-        if ((in->size << 1) >= in->max_size &&
-            (in->reported_size << 1) < in->max_size)
-          check_caps(in, false);
+      } else if (is_max_size_approaching(in)) {
+        check_caps(in, false);
       }
     }
   }
@@ -12059,8 +12122,16 @@ void Client::ms_handle_remote_reset(Connection *con)
 	  break;
 
 	case MetaSession::STATE_OPEN:
-	  ldout(cct, 1) << "reset from mds we were open; mark session as stale" << dendl;
-	  s->state = MetaSession::STATE_STALE;
+	  {
+	    const md_config_t *conf = cct->_conf;
+	    if (conf->client_reconnect_stale) {
+	      ldout(cct, 1) << "reset from mds we were open; close mds session for reconnect" << dendl;
+	      _closed_mds_session(s);
+	    } else {
+	      ldout(cct, 1) << "reset from mds we were open; mark session as stale" << dendl;
+	      s->state = MetaSession::STATE_STALE;
+	    }
+	  }
 	  break;
 
 	case MetaSession::STATE_NEW:

@@ -1,3 +1,4 @@
+// -*- mode:C++; tab-width:8; c-basic-offset:2; indent-tabs-mode:t -*-
 // vim: ts=8 sw=2 smarttab
 
 #include <errno.h>
@@ -66,6 +67,7 @@ void _usage()
   cout << "  key create                 create access key\n";
   cout << "  key rm                     remove access key\n";
   cout << "  bucket list                list buckets\n";
+  cout << "  bucket limit check         show bucket sharding stats\n";
   cout << "  bucket link                link bucket to specified user\n";
   cout << "  bucket unlink              unlink bucket from specified user\n";
   cout << "  bucket stats               returns bucket statistics\n";
@@ -76,6 +78,7 @@ void _usage()
   cout << "  bi put                     store bucket index object entries\n";
   cout << "  bi list                    list raw bucket index entries\n";
   cout << "  object rm                  remove object\n";
+  cout << "  object stat                stat an object for its metadata\n";
   cout << "  object unlink              unlink object from bucket index\n";
   cout << "  objects expire             run expired objects cleanup\n";
   cout << "  period delete              delete a period\n";
@@ -115,8 +118,6 @@ void _usage()
   cout << "  zonegroup placement modify modify a placement target of a specific zonegroup\n";
   cout << "  zonegroup placement rm     remove a placement target from a zonegroup\n";
   cout << "  zonegroup placement default  set a zonegroup's default placement target\n";
-  cout << "  zonegroup-map get          show zonegroup-map\n";
-  cout << "  zonegroup-map set          set zonegroup-map (requires infile)\n";
   cout << "  zone create                create a new zone\n";
   cout << "  zone delete                delete a zone\n";
   cout << "  zone get                   show zone cluster params\n";
@@ -249,7 +250,9 @@ void _usage()
   cout << "   --categories=<list>       comma separated list of categories, used in usage show\n";
   cout << "   --caps=<caps>             list of caps (e.g., \"usage=read, write; user=read\"\n";
   cout << "   --yes-i-really-mean-it    required for certain operations\n";
-  cout << "   --reset-regions           reset regionmap when regionmap update\n";
+  cout << "   --warnings-only           when specified with bucket limit check, list\n";
+  cout << "                             only buckets nearing or over the current max\n";
+  cout << "                             objects per shard value\n";
   cout << "   --bypass-gc               when specified with bucket deletion, triggers\n";
   cout << "                             object deletions by not involving GC\n";
   cout << "   --inconsistent-index      when specified with bucket deletion and bypass-gc set to true,\n";
@@ -293,6 +296,7 @@ enum {
   OPT_KEY_CREATE,
   OPT_KEY_RM,
   OPT_BUCKETS_LIST,
+  OPT_BUCKETS_LIMIT_CHECK,
   OPT_BUCKET_LINK,
   OPT_BUCKET_UNLINK,
   OPT_BUCKET_STATS,
@@ -345,10 +349,7 @@ enum {
   OPT_ZONEGROUP_PLACEMENT_RM,
   OPT_ZONEGROUP_PLACEMENT_LIST,
   OPT_ZONEGROUP_PLACEMENT_DEFAULT,
-  OPT_ZONEGROUPMAP_GET,
-  OPT_ZONEGROUPMAP_SET,
-  OPT_ZONEGROUPMAP_UPDATE,
-  OPT_ZONE_CREATE,  
+  OPT_ZONE_CREATE,
   OPT_ZONE_DELETE,
   OPT_ZONE_GET,
   OPT_ZONE_MODIFY,
@@ -440,9 +441,6 @@ static int get_cmd(const char *cmd, const char *prev_cmd, const char *prev_prev_
       strcmp(cmd, "pools") == 0 ||
       strcmp(cmd, "quota") == 0 ||
       strcmp(cmd, "realm") == 0 ||
-      strcmp(cmd, "region") == 0 ||
-      strcmp(cmd, "region-map") == 0 ||
-      strcmp(cmd, "regionmap") == 0 ||
       strcmp(cmd, "replicalog") == 0 ||
       strcmp(cmd, "subuser") == 0 ||
       strcmp(cmd, "sync") == 0 ||
@@ -450,9 +448,7 @@ static int get_cmd(const char *cmd, const char *prev_cmd, const char *prev_prev_
       strcmp(cmd, "user") == 0 ||
       strcmp(cmd, "zone") == 0 ||
       strcmp(cmd, "zonegroup") == 0 ||
-      strcmp(cmd, "zonegroups") == 0 ||
-      strcmp(cmd, "zonegroup-map") == 0 ||
-      strcmp(cmd, "zonegroupmap") == 0 )
+      strcmp(cmd, "zonegroups") == 0)
 {
     *need_more = true;
     return 0;
@@ -496,6 +492,10 @@ static int get_cmd(const char *cmd, const char *prev_cmd, const char *prev_prev_
   } else if (strcmp(prev_cmd, "buckets") == 0) {
     if (strcmp(cmd, "list") == 0)
       return OPT_BUCKETS_LIST;
+    if (strcmp(cmd, "limit") == 0) {
+      *need_more = true;
+      return 0;
+    }
   } else if (strcmp(prev_cmd, "bucket") == 0) {
     if (strcmp(cmd, "list") == 0)
       return OPT_BUCKETS_LIST;
@@ -517,14 +517,18 @@ static int get_cmd(const char *cmd, const char *prev_cmd, const char *prev_prev_
       *need_more = true;
       return 0;
     }
-  } else if ((prev_prev_cmd && strcmp(prev_prev_cmd, "bucket") == 0) &&
-	     (strcmp(prev_cmd, "sync") == 0)) {
-    if (strcmp(cmd, "status") == 0)
-      return OPT_BUCKET_SYNC_STATUS;
-    if (strcmp(cmd, "init") == 0)
-      return OPT_BUCKET_SYNC_INIT;
-    if (strcmp(cmd, "run") == 0)
-      return OPT_BUCKET_SYNC_RUN;
+  } else if (prev_prev_cmd && strcmp(prev_prev_cmd, "bucket") == 0) {
+    if (strcmp(prev_cmd, "sync") == 0) {
+      if (strcmp(cmd, "status") == 0)
+	return OPT_BUCKET_SYNC_STATUS;
+      if (strcmp(cmd, "init") == 0)
+	return OPT_BUCKET_SYNC_INIT;
+      if (strcmp(cmd, "run") == 0)
+	return OPT_BUCKET_SYNC_RUN;
+    } else if ((strcmp(prev_cmd, "limit") == 0) &&
+	       (strcmp(cmd, "check") == 0)) {
+      return OPT_BUCKETS_LIMIT_CHECK;
+    }
   } else if (strcmp(prev_cmd, "log") == 0) {
     if (strcmp(cmd, "list") == 0)
       return OPT_LOG_LIST;
@@ -630,8 +634,7 @@ static int get_cmd(const char *cmd, const char *prev_cmd, const char *prev_prev_
       return OPT_ZONEGROUP_PLACEMENT_LIST;
     if (strcmp(cmd, "default") == 0)
       return OPT_ZONEGROUP_PLACEMENT_DEFAULT;
-  } else if (strcmp(prev_cmd, "zonegroup") == 0 ||
-	     strcmp(prev_cmd, "region") == 0) {
+  } else if (strcmp(prev_cmd, "zonegroup") == 0) {
     if (strcmp(cmd, "add") == 0)
       return OPT_ZONEGROUP_ADD;
     if (strcmp(cmd, "create")== 0)
@@ -659,20 +662,9 @@ static int get_cmd(const char *cmd, const char *prev_cmd, const char *prev_prev_
       return OPT_QUOTA_ENABLE;
     if (strcmp(cmd, "disable") == 0)
       return OPT_QUOTA_DISABLE;
-  } else if (strcmp(prev_cmd, "zonegroups") == 0 ||
-	     strcmp(prev_cmd, "regions") == 0) {
+  } else if (strcmp(prev_cmd, "zonegroups") == 0) {
     if (strcmp(cmd, "list") == 0)
       return OPT_ZONEGROUP_LIST;
-  } else if (strcmp(prev_cmd, "zonegroup-map") == 0 ||
-             strcmp(prev_cmd, "zonegroupmap") == 0 ||
-	     strcmp(prev_cmd, "region-map") == 0 ||
-             strcmp(prev_cmd, "regionmap") == 0) {
-    if (strcmp(cmd, "get") == 0)
-      return OPT_ZONEGROUPMAP_GET;
-    if (strcmp(cmd, "set") == 0)
-      return OPT_ZONEGROUPMAP_SET;
-    if (strcmp(cmd, "update") == 0)
-      return OPT_ZONEGROUPMAP_UPDATE;
   } else if ((prev_prev_cmd && strcmp(prev_prev_cmd, "zone") == 0) &&
 	     (strcmp(prev_cmd, "placement") == 0)) {
     if (strcmp(cmd, "add") == 0)
@@ -1420,7 +1412,7 @@ static int send_to_url(const string& url, const string& access,
   key.id = access;
   key.key = secret;
 
-  list<pair<string, string> > params;
+  param_vec_t params;
   RGWRESTSimpleRequest req(g_ceph_context, url, NULL, &params);
 
   bufferlist response;
@@ -1831,13 +1823,12 @@ static void get_data_sync_status(const string& source_zone, list<string>& status
     return;
   }
 
-  ret = sync.read_sync_status();
-  if (ret < 0) {
+  rgw_data_sync_status sync_status;
+  ret = sync.read_sync_status(&sync_status);
+  if (ret < 0 && ret != -ENOENT) {
     push_ss(ss, status, tab) << string("failed read sync status: ") + cpp_strerror(-ret);
     return;
   }
-
-  const rgw_data_sync_status& sync_status = sync.get_sync_status();
 
   string status_str;
   switch (sync_status.sync_info.state) {
@@ -1977,7 +1968,7 @@ static void sync_status(Formatter *formatter)
 
   list<string> md_status;
 
-  if (zone.id == zonegroup.master_zone) {
+  if (store->is_meta_master()) {
     md_status.push_back("no sync (zone is master)");
   } else {
     get_md_sync_status(md_status);
@@ -2192,7 +2183,8 @@ int main(int argc, char **argv)
   argv_to_vec(argc, (const char **)argv, args);
   env_to_vec(args);
 
-  global_init(NULL, args, CEPH_ENTITY_TYPE_CLIENT, CODE_ENVIRONMENT_UTILITY, 0);
+  auto cct = global_init(NULL, args, CEPH_ENTITY_TYPE_CLIENT,
+                         CODE_ENVIRONMENT_UTILITY, 0);
   common_init_finish(g_ceph_context);
 
   rgw_user user_id;
@@ -2284,8 +2276,8 @@ int main(int argc, char **argv)
   int include_all = false;
 
   int sync_stats = false;
-  int reset_regions = false;
   int bypass_gc = false;
+  int warnings_only = false;
   int inconsistent_index = false;
 
   int verbose = false;
@@ -2508,11 +2500,11 @@ int main(int argc, char **argv)
      // do nothing
     } else if (ceph_argparse_binary_flag(args, i, &include_all, NULL, "--include-all", (char*)NULL)) {
      // do nothing
-    } else if (ceph_argparse_binary_flag(args, i, &reset_regions, NULL, "--reset-regions", (char*)NULL)) {
-     // do nothing
     } else if (ceph_argparse_binary_flag(args, i, &extra_info, NULL, "--extra-info", (char*)NULL)) {
      // do nothing
     } else if (ceph_argparse_binary_flag(args, i, &bypass_gc, NULL, "--bypass-gc", (char*)NULL)) {
+     // do nothing
+    } else if (ceph_argparse_binary_flag(args, i, &warnings_only, NULL, "--warnings-only", (char*)NULL)) {
      // do nothing
     } else if (ceph_argparse_binary_flag(args, i, &inconsistent_index, NULL, "--inconsistent-index", (char*)NULL)) {
      // do nothing
@@ -2711,8 +2703,6 @@ int main(int argc, char **argv)
 			 OPT_ZONEGROUP_PLACEMENT_ADD, OPT_ZONEGROUP_PLACEMENT_RM,
 			 OPT_ZONEGROUP_PLACEMENT_MODIFY, OPT_ZONEGROUP_PLACEMENT_LIST,
 			 OPT_ZONEGROUP_PLACEMENT_DEFAULT,
-                         OPT_ZONEGROUPMAP_GET, OPT_ZONEGROUPMAP_SET,
-                         OPT_ZONEGROUPMAP_UPDATE,
 			 OPT_ZONE_CREATE, OPT_ZONE_DELETE,
                          OPT_ZONE_GET, OPT_ZONE_SET, OPT_ZONE_RENAME,
                          OPT_ZONE_LIST, OPT_ZONE_MODIFY, OPT_ZONE_DEFAULT,
@@ -2950,7 +2940,7 @@ int main(int argc, char **argv)
 	list<string> realms;
 	ret = store->list_realms(realms);
 	if (ret < 0) {
-	  cerr << "failed to list realmss: " << cpp_strerror(-ret) << std::endl;
+	  cerr << "failed to list realms: " << cpp_strerror(-ret) << std::endl;
 	  return -ret;
 	}
 	formatter->open_object_section("realms_list");
@@ -3550,78 +3540,6 @@ int main(int argc, char **argv)
         formatter->flush(cout);
       }
       break;
-    case OPT_ZONEGROUPMAP_GET:
-      {
-	RGWZoneGroupMap zonegroupmap;
-
-	int ret = zonegroupmap.read(g_ceph_context, store);
-	if (ret < 0 && ret != -ENOENT) {
-	  cerr << "failed to read zonegroupmap info: " << cpp_strerror(ret);
-	  return ret;
-	}
-		
-	encode_json("zonegroup-map", zonegroupmap, formatter);
-	formatter->flush(cout);
-      }
-      break;
-    case OPT_ZONEGROUPMAP_SET:
-      {
-	RGWZoneGroupMap zonegroupmap;
-	int ret = read_decode_json(infile, zonegroupmap);
-	if (ret < 0) {
-	  cerr << "ERROR: failed to read map json: " << cpp_strerror(-ret) << std::endl;
-	  return ret;
-	}
-
-	RGWPeriod period;
-	ret = period.init(g_ceph_context, store);
-	if (ret < 0) {
-	  cerr << "ERROR: failed to read current period info: " << cpp_strerror(-ret) << std::endl;
-	  return ret;
-	}
-
-	period.fork();
-	period.update(zonegroupmap);
-	period.store_info(false);
-
-	encode_json("zonegroup-map", zonegroupmap, formatter);
-	formatter->flush(cout);
-      }
-      break;
-    case OPT_ZONEGROUPMAP_UPDATE:
-      {
-	RGWZoneGroupMap zonegroupmap;
-	int ret = zonegroupmap.read(g_ceph_context, store);
-	if (ret < 0 && ret != -ENOENT) {
-	  cerr << "failed to read zonegroup map: " << cpp_strerror(-ret) << std::endl;
-	  return -ret;
-	}
-
-	if (reset_regions) {
-          zonegroupmap.zonegroups.clear();
-        }
-
-	list<string> realms;
-	ret = store->list_realms(realms);
-	if (ret < 0) {
-	  cerr << "failed to list realms: " << cpp_strerror(-ret) << std::endl;
-	  return -ret;
-	}
-
-	for (list<string>::iterator iter = realms.begin(); iter != realms.end(); ++iter)
-	{
-	  RGWRealm realm("", *iter);
-	  ret = realm.init(g_ceph_context, store);
-	  if (ret < 0) {
-	    cerr << "failed to init realm: " << cpp_strerror(-ret) << std::endl;
-	    return -ret;
-	  }
-	}
-
-	encode_json("zonegroup-map", zonegroupmap, formatter);
-	formatter->flush(cout);
-      }
-      break;
     case OPT_ZONE_CREATE:
       {
         if (zone_name.empty()) {
@@ -3642,7 +3560,7 @@ int main(int argc, char **argv)
 	  }
 	}
 
-	RGWZoneParams zone(zone_name);
+	RGWZoneParams zone(zone_id, zone_name);
 	ret = zone.init(g_ceph_context, store, false);
 	if (ret < 0) {
 	  cerr << "unable to initialize zone: " << cpp_strerror(-ret) << std::endl;
@@ -4405,6 +4323,51 @@ int main(int argc, char **argv)
     }
   }
 
+  if (opt_cmd == OPT_BUCKETS_LIMIT_CHECK) {
+    void *handle;
+    std::list<std::string> user_ids;
+    metadata_key = "user";
+    int max = 1000;
+
+    bool truncated;
+
+    if (! user_id.empty()) {
+      user_ids.push_back(user_id.id);
+      ret =
+	RGWBucketAdminOp::limit_check(store, bucket_op, user_ids, f,
+	  warnings_only);
+    } else {
+      /* list users in groups of max-keys, then perform user-bucket
+       * limit-check on each group */
+     ret = store->meta_mgr->list_keys_init(metadata_key, &handle);
+      if (ret < 0) {
+	cerr << "ERROR: buckets limit check can't get user metadata_key: "
+	     << cpp_strerror(-ret) << std::endl;
+	return -ret;
+      }
+
+      do {
+	ret = store->meta_mgr->list_keys_next(handle, max, user_ids,
+					      &truncated);
+	if (ret < 0 && ret != -ENOENT) {
+	  cerr << "ERROR: buckets limit check lists_keys_next(): "
+	       << cpp_strerror(-ret) << std::endl;
+	  break;
+	} else {
+	  /* ok, do the limit checks for this group */
+	  ret =
+	    RGWBucketAdminOp::limit_check(store, bucket_op, user_ids, f,
+	      warnings_only);
+	  if (ret < 0)
+	    break;
+	}
+	user_ids.clear();
+      } while (truncated);
+      store->meta_mgr->list_keys_complete(handle);
+    }
+    return -ret;
+  } /* OPT_BUCKETS_LIMIT_CHECK */
+
   if (opt_cmd == OPT_BUCKETS_LIST) {
     if (bucket_name.empty()) {
       RGWBucketAdminOp::info(store, bucket_op, f);
@@ -4455,8 +4418,8 @@ int main(int argc, char **argv)
 
       formatter->close_section();
       formatter->flush(cout);
-    }
-  }
+    } /* have bucket_name */
+  } /* OPT_BUCKETS_LIST */
 
   if (opt_cmd == OPT_BUCKET_STATS) {
     bucket_op.set_fetch_stats(true);
@@ -5735,13 +5698,12 @@ next:
       return -ret;
     }
 
-    ret = sync.read_sync_status();
-    if (ret < 0) {
+    rgw_data_sync_status sync_status;
+    ret = sync.read_sync_status(&sync_status);
+    if (ret < 0 && ret != -ENOENT) {
       cerr << "ERROR: sync.read_sync_status() returned ret=" << ret << std::endl;
       return -ret;
     }
-
-    rgw_data_sync_status& sync_status = sync.get_sync_status();
 
     formatter->open_object_section("summary");
     encode_json("sync_status", sync_status, formatter);

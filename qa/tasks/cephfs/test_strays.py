@@ -235,11 +235,11 @@ class TestStrays(CephFSTestCase):
 
         # Write some bytes to a file
         size_mb = 8
-        self.mount_a.write_n_mb("open_file", size_mb)
-        open_file_ino = self.mount_a.path_to_ino("open_file")
 
         # Hold the file open
         p = self.mount_a.open_background("open_file")
+        self.mount_a.write_n_mb("open_file", size_mb)
+        open_file_ino = self.mount_a.path_to_ino("open_file")
 
         self.assertEqual(self.get_session(mount_a_client_id)['num_caps'], 2)
 
@@ -671,7 +671,7 @@ class TestStrays(CephFSTestCase):
         self.mount_a.run_shell(["touch", file_name])
 
         file_layout = "stripe_unit=1048576 stripe_count=4 object_size=8388608"
-        self.mount_a.run_shell(["setfattr", "-n", "ceph.file.layout", "-v", file_layout, file_name])
+        self.mount_a.setfattr(file_name, "ceph.file.layout", file_layout)
 
         # 35MB requires 7 objects
         size_mb = 35

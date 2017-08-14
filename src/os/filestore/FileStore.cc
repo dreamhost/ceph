@@ -3103,12 +3103,15 @@ more:
     last = extent++;
   }
   const bool is_last = last->fe_flags & FIEMAP_EXTENT_LAST;
-  free(fiemap);
   if (!is_last) {
     uint64_t xoffset = last->fe_logical + last->fe_length - offset;
     offset = last->fe_logical + last->fe_length;
     len -= xoffset;
+    free(fiemap); /* fix clang warn: use-after-free */
     goto more;
+  }
+  else {
+    free(fiemap);
   }
 
   return r;
@@ -5254,7 +5257,7 @@ int FileStore::_collection_move_rename(const coll_t& oldcid, const ghobject_t& o
 
     if (r == 0) {
       // the name changed; link the omap content
-      r = object_map->clone(oldoid, o, &spos);
+      r = object_map->rename(oldoid, o, &spos);
       if (r == -ENOENT)
 	r = 0;
     }
@@ -5520,7 +5523,10 @@ int FileStore::_set_alloc_hint(const coll_t& cid, const ghobject_t& oid,
   dout(15) << "set_alloc_hint " << cid << "/" << oid << " object_size " << expected_object_size << " write_size " << expected_write_size << dendl;
 
   FDRef fd;
-  int ret;
+  int ret = 0;
+
+  if (expected_object_size == 0 || expected_write_size == 0)
+    goto out;
 
   ret = lfn_open(cid, oid, false, &fd);
   if (ret < 0)

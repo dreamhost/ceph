@@ -17,6 +17,7 @@
     key create                 create access key
     key rm                     remove access key
     bucket list                list buckets
+    bucket limit check         show bucket sharding stats
     bucket link                link bucket to specified user
     bucket unlink              unlink bucket from specified user
     bucket stats               returns bucket statistics
@@ -27,6 +28,7 @@
     bi put                     store bucket index object entries
     bi list                    list raw bucket index entries
     object rm                  remove object
+    object stat                stat an object for its metadata
     object unlink              unlink object from bucket index
     objects expire             run expired objects cleanup
     period delete              delete a period
@@ -66,8 +68,6 @@
     zonegroup placement modify modify a placement target of a specific zonegroup
     zonegroup placement rm     remove a placement target from a zonegroup
     zonegroup placement default  set a zonegroup's default placement target
-    zonegroup-map get          show zonegroup-map
-    zonegroup-map set          set zonegroup-map (requires infile)
     zone create                create a new zone
     zone delete                delete a zone
     zone get                   show zone cluster params
@@ -200,7 +200,9 @@
      --categories=<list>       comma separated list of categories, used in usage show
      --caps=<caps>             list of caps (e.g., "usage=read, write; user=read"
      --yes-i-really-mean-it    required for certain operations
-     --reset-regions           reset regionmap when regionmap update
+     --warnings-only           when specified with bucket limit check, list
+                               only buckets nearing or over the current max
+                               objects per shard value
      --bypass-gc               when specified with bucket deletion, triggers
                                object deletions by not involving GC
      --inconsistent-index      when specified with bucket deletion and bypass-gc set to true,

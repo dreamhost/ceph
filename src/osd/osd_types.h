@@ -929,6 +929,8 @@ inline ostream& operator<<(ostream& out, const osd_stat_t& s) {
 #define PG_STATE_UNDERSIZED    (1<<23) // pg acting < pool size
 #define PG_STATE_ACTIVATING   (1<<24) // pg is peered but not yet active
 #define PG_STATE_PEERED        (1<<25) // peered, cannot go active, can recover
+#define PG_STATE_SNAPTRIM      (1<<26) // trimming snaps
+#define PG_STATE_SNAPTRIM_WAIT (1<<27) // queued to trim snaps
 
 std::string pg_state_string(int state);
 std::string pg_vector_string(const vector<int32_t> &a);
@@ -3325,6 +3327,10 @@ struct object_info_t {
   // opportunistic checksums; may or may not be present
   __u32 data_digest;  ///< data crc32c
   __u32 omap_digest;  ///< omap crc32c
+  
+  // alloc hint attribute
+  uint64_t expected_object_size, expected_write_size;
+  uint32_t alloc_hint_flags;
 
   void copy_user_bits(const object_info_t& other);
 
@@ -3395,14 +3401,18 @@ struct object_info_t {
   explicit object_info_t()
     : user_version(0), size(0), flags((flag_t)0),
       truncate_seq(0), truncate_size(0),
-      data_digest(-1), omap_digest(-1)
+      data_digest(-1), omap_digest(-1),
+      expected_object_size(0), expected_write_size(0),
+      alloc_hint_flags(0)
   {}
 
   explicit object_info_t(const hobject_t& s)
     : soid(s),
       user_version(0), size(0), flags((flag_t)0),
       truncate_seq(0), truncate_size(0),
-      data_digest(-1), omap_digest(-1)
+      data_digest(-1), omap_digest(-1),
+      expected_object_size(0), expected_write_size(0),
+      alloc_hint_flags(0)
   {}
 
   explicit object_info_t(bufferlist& bl) {

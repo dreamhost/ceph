@@ -118,8 +118,9 @@ int main(int argc, const char **argv)
   // option, therefore we will pass it as a default argument to global_init().
   def_args.push_back("--leveldb-log=");
 
-  global_init(&def_args, args, CEPH_ENTITY_TYPE_OSD, CODE_ENVIRONMENT_DAEMON,
-	      0, "osd_data");
+  auto cct = global_init(&def_args, args, CEPH_ENTITY_TYPE_OSD,
+			 CODE_ENVIRONMENT_DAEMON,
+			 0, "osd_data");
   ceph_heap_profiler_init();
 
   // osd specific args
@@ -360,13 +361,16 @@ int main(int argc, const char **argv)
       derr << TEXT_RED << " ** ERROR: error flushing journal " << g_conf->osd_journal
 	   << " for object store " << g_conf->osd_data
 	   << ": " << cpp_strerror(-err) << TEXT_NORMAL << dendl;
-      exit(1);
+      goto flushjournal_out;
     }
     store->umount();
     derr << "flushed journal " << g_conf->osd_journal
 	 << " for object store " << g_conf->osd_data
 	 << dendl;
-    exit(0);
+flushjournal_out:
+    delete store;
+    g_ceph_context->put();
+    exit(err < 0 ? 1 : 0);
   }
   if (dump_journal) {
     common_init_finish(g_ceph_context);
@@ -643,7 +647,6 @@ int main(int argc, const char **argv)
 
   client_byte_throttler.reset();
   client_msg_throttler.reset();
-  g_ceph_context->put();
 
   // cd on exit, so that gmon.out (if any) goes into a separate directory for each node.
   char s[20];

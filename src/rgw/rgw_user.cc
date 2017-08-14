@@ -373,9 +373,11 @@ int rgw_remove_uid_index(RGWRados *store, rgw_user& uid)
 
 int rgw_remove_email_index(RGWRados *store, string& email)
 {
+  if (email.empty()) {
+    return 0;
+  }
   rgw_obj obj(store->get_zone_params().user_email_pool, email);
-  int ret = store->delete_system_obj(obj);
-  return ret;
+  return store->delete_system_obj(obj);
 }
 
 int rgw_remove_swift_name_index(RGWRados *store, string& swift_name)
@@ -443,11 +445,11 @@ int rgw_delete_user(RGWRados *store, RGWUserInfo& info, RGWObjVersionTracker& ob
     }
   }
 
-  rgw_obj email_obj(store->get_zone_params().user_email_pool, info.user_email);
   ldout(store->ctx(), 10) << "removing email index: " << info.user_email << dendl;
-  ret = store->delete_system_obj(email_obj);
+  ret = rgw_remove_email_index(store, info.user_email);
   if (ret < 0 && ret != -ENOENT) {
-    ldout(store->ctx(), 0) << "ERROR: could not remove " << info.user_id << ":" << email_obj << ", should be fixed (err=" << ret << ")" << dendl;
+    ldout(store->ctx(), 0) << "ERROR: could not remove email index object for "
+        << info.user_email << ", should be fixed (err=" << ret << ")" << dendl;
     return ret;
   }
 
@@ -1389,6 +1391,7 @@ int RGWSubUserPool::add(RGWUserAdminOpState& op_state, std::string *err_msg, boo
 {
   std::string subprocess_msg;
   int ret;
+  int32_t key_type = op_state.get_key_type();
 
   ret = check_op(op_state, &subprocess_msg);
   if (ret < 0) {
@@ -1396,6 +1399,10 @@ int RGWSubUserPool::add(RGWUserAdminOpState& op_state, std::string *err_msg, boo
     return ret;
   }
 
+  if (key_type == KEY_TYPE_S3 && op_state.get_access_key().empty()) {
+    op_state.set_gen_access();
+  }
+  
   if (op_state.get_secret_key().empty()) {
     op_state.set_gen_secret();
   }

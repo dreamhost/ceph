@@ -43,9 +43,9 @@ public:
 
   void reacquire_lock(Context *on_reacquired = nullptr);
 
-  void handle_peer_notification(int r);
+  int assert_header_locked();
 
-  void assert_header_locked(librados::ObjectWriteOperation *op);
+  void handle_peer_notification(int r);
 
   static bool decode_lock_cookie(const std::string &cookie, uint64_t *handle);
 

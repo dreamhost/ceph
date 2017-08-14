@@ -1,0 +1,10 @@
+
+tasks:
+  - cephfs_test_runner:
+      modules:
+        - tasks.cephfs.test_quota
+overrides:
+  ceph:
+    conf:
+      client:
+        client quota: true

@@ -178,8 +178,6 @@ static RGWRESTMgr *set_logging(RGWRESTMgr *mgr)
   return mgr;
 }
 
-void intrusive_ptr_add_ref(CephContext* cct) { cct->get(); }
-void intrusive_ptr_release(CephContext* cct) { cct->put(); }
 
 /*
  * start up the RADOS connection and then handle HTTP messages as they come in
@@ -249,8 +247,10 @@ int main(int argc, const char **argv)
   // Now that we've determined which frontend(s) to use, continue with global
   // initialization. Passing false as the final argument ensures that
   // global_pre_init() is not invoked twice.
-  global_init(&def_args, args, CEPH_ENTITY_TYPE_CLIENT, CODE_ENVIRONMENT_DAEMON,
-	      flags, "rgw_data", false);
+  // claim the reference and release it after subsequent destructors have fired
+  auto cct = global_init(&def_args, args, CEPH_ENTITY_TYPE_CLIENT,
+			 CODE_ENVIRONMENT_DAEMON,
+			 flags, "rgw_data", false);
 
   for (std::vector<const char*>::iterator i = args.begin(); i != args.end(); ++i) {
     if (ceph_argparse_flag(args, i, "-h", "--help", (char*)NULL)) {
@@ -289,9 +289,6 @@ int main(int argc, const char **argv)
   g_ceph_context->enable_perf_counter();
 
   common_init_finish(g_ceph_context);
-
-  // claim the reference and release it after subsequent destructors have fired
-  boost::intrusive_ptr<CephContext> cct(g_ceph_context, false);
 
   rgw_tools_init(g_ceph_context);
 
@@ -443,10 +440,7 @@ int main(int argc, const char **argv)
 
       fe = new RGWFCGXFrontend(fcgi_pe, config);
     } else if (framework == "civetweb" || framework == "mongoose") {
-      int port;
-      config->get_val("port", 80, &port);
-
-      RGWProcessEnv env = { store, &rest, olog, port };
+      RGWProcessEnv env = { store, &rest, olog, 0 };
 
       fe = new RGWMongooseFrontend(env, config);
     } else if (framework == "loadgen") {

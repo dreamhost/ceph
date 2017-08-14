@@ -157,7 +157,10 @@ class CephFSMount(object):
     def open_background(self, basename="background_file"):
         """
         Open a file for writing, then block such that the client
-        will hold a capability
+        will hold a capability.
+
+        Don't return until the remote process has got as far as opening
+        the file, then return the RemoteProcess instance.
         """
         assert(self.is_mounted())
 
@@ -176,6 +179,12 @@ class CephFSMount(object):
 
         rproc = self._run_python(pyscript)
         self.background_procs.append(rproc)
+
+        # This wait would not be sufficient if the file had already
+        # existed, but it's simple and in practice users of open_background
+        # are not using it on existing files.
+        self.wait_for_visible(basename)
+
         return rproc
 
     def wait_for_visible(self, basename="background_file", timeout=30):
@@ -559,13 +568,33 @@ class CephFSMount(object):
             # gives you [''] instead of []
             return []
 
+    def setfattr(self, path, key, val):
+        """
+        Wrap setfattr.
+
+        :param path: relative to mount point
+        :param key: xattr name
+        :param val: xattr value
+        :return: None
+        """
+        self.run_shell(["setfattr", "-n", key, "-v", val, path])
+
     def getfattr(self, path, attr):
         """
-        Wrap getfattr: return the values of a named xattr on one file.
+        Wrap getfattr: return the values of a named xattr on one file, or
+        None if the attribute is not found.
 
         :return: a string
         """
-        p = self.run_shell(["getfattr", "--only-values", "-n", attr, path])
+        p = self.run_shell(["getfattr", "--only-values", "-n", attr, path], wait=False)
+        try:
+            p.wait()
+        except CommandFailedError as e:
+            if e.exitstatus == 1 and "No such attribute" in p.stderr.getvalue():
+                return None
+            else:
+                raise
+
         return p.stdout.getvalue()
 
     def df(self):

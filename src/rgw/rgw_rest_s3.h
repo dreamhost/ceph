@@ -30,6 +30,7 @@ public:
   RGWGetObj_ObjStore_S3() {}
   ~RGWGetObj_ObjStore_S3() {}
 
+  int get_params() override;
   int send_response_data_error();
   int send_response_data(bufferlist& bl, off_t ofs, off_t len);
   void set_custom_http_response(int http_ret) { custom_http_ret = http_ret; }
@@ -362,6 +363,14 @@ public:
   void send_partial_response(rgw_obj_key& key, bool delete_marker,
                              const string& marker_version_id, int ret);
   void end_response();
+};
+
+class RGWGetObjLayout_ObjStore_S3 : public RGWGetObjLayout {
+public:
+  RGWGetObjLayout_ObjStore_S3() {}
+  ~RGWGetObjLayout_ObjStore_S3() {}
+
+  void send_response();
 };
 
 class RGW_Auth_S3_Keystone_ValidateToken : public RGWHTTPClient {

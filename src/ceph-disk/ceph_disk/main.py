@@ -617,22 +617,36 @@ def get_partition_dev(dev, pnum):
        sda 1 -> sda1
        cciss/c0d1 1 -> cciss!c0d1p1
     """
-    partname = None
-    if is_mpath(dev):
-        partname = get_partition_mpath(dev, pnum)
-    else:
-        name = get_dev_name(os.path.realpath(dev))
-        for f in os.listdir(os.path.join('/sys/block', name)):
-            if f.startswith(name) and f.endswith(str(pnum)):
-                # we want the shortest name that starts with the base name
-                # and ends with the partition number
-                if not partname or len(f) < len(partname):
-                    partname = f
-    if partname:
-        return get_dev_path(partname)
-    else:
-        raise Error('partition %d for %s does not appear to exist' %
-                    (pnum, dev))
+    max_retry = 10
+    for retry in range(0, max_retry + 1):
+        partname = None
+        error_msg = ""
+        if is_mpath(dev):
+            partname = get_partition_mpath(dev, pnum)
+        else:
+            name = get_dev_name(os.path.realpath(dev))
+            sys_entry = os.path.join('/sys/block', name)
+            error_msg = " in %s" % sys_entry
+            for f in os.listdir(sys_entry):
+                if f.startswith(name) and f.endswith(str(pnum)):
+                    # we want the shortest name that starts with the base name
+                    # and ends with the partition number
+                    if not partname or len(f) < len(partname):
+                        partname = f
+        if partname:
+            if retry:
+                LOG.info('Found partition %d for %s after %d tries' %
+                         (pnum, dev, retry))
+            return get_dev_path(partname)
+        else:
+            if retry < max_retry:
+                LOG.info('Try %d/%d : partition %d for %s does not exist%s' %
+                         (retry + 1, max_retry, pnum, dev, error_msg))
+                time.sleep(.2)
+                continue
+            else:
+                raise Error('partition %d for %s does not appear to exist%s' %
+                            (pnum, dev, error_msg))
 
 
 def list_all_partitions():
@@ -1136,10 +1150,19 @@ def get_dmcrypt_key(
     if os.path.exists(path):
         mode = get_oneliner(path, 'key-management-mode')
         osd_uuid = get_oneliner(path, 'osd-uuid')
+        ceph_fsid = read_one_line(path, 'ceph_fsid')
+        if ceph_fsid is None:
+            raise Error('No cluster uuid assigned.')
+        cluster = find_cluster_by_uuid(ceph_fsid)
+        if cluster is None:
+            raise Error('No cluster conf found in ' + SYSCONFDIR +
+                        ' with fsid %s' % ceph_fsid)
+
         if mode == KEY_MANAGEMENT_MODE_V1:
             key, stderr, ret = command(
                 [
                     'ceph',
+                    '--cluster', cluster,
                     '--name',
                     'client.osd-lockbox.' + osd_uuid,
                     '--keyring',
@@ -1513,6 +1536,26 @@ def adjust_symlink(target, path):
             os.symlink(target, path)
         except:
             raise Error('unable to create symlink %s -> %s' % (path, target))
+
+
+def get_mount_options(cluster, fs_type):
+    mount_options = get_conf(
+        cluster,
+        variable='osd_mount_options_{fstype}'.format(
+            fstype=fs_type,
+        ),
+    )
+    if mount_options is None:
+        mount_options = get_conf(
+            cluster,
+            variable='osd_fs_mount_options_{fstype}'.format(
+                fstype=fs_type,
+            ),
+        )
+    else:
+        # remove whitespaces
+        mount_options = "".join(mount_options.split())
+    return mount_options
 
 
 class Device(object):
@@ -2302,6 +2345,7 @@ class Lockbox(object):
         command_check_call(
             [
                 'ceph',
+                '--cluster', cluster,
                 '--name', 'client.bootstrap-osd',
                 '--keyring', bootstrap,
                 'config-key',
@@ -2313,6 +2357,7 @@ class Lockbox(object):
         keyring, stderr, ret = command(
             [
                 'ceph',
+                '--cluster', cluster,
                 '--name', 'client.bootstrap-osd',
                 '--keyring', bootstrap,
                 'auth',
@@ -2350,6 +2395,9 @@ class Lockbox(object):
         LOG.debug('Mounting lockbox ' + str(" ".join(args)))
         command_check_call(args)
         write_one_line(path, 'osd-uuid', self.args.osd_uuid)
+        if self.args.cluster_uuid is None:
+            self.args.cluster_uuid = get_fsid(cluster=self.args.cluster)
+        write_one_line(path, 'ceph_fsid', self.args.cluster_uuid)
         self.create_key()
         self.symlink_spaces(path)
         write_one_line(path, 'magic', CEPH_LOCKBOX_ONDISK_MAGIC)
@@ -2546,22 +2594,8 @@ class PrepareData(object):
                 ),
             )
 
-        self.mount_options = get_conf(
-            cluster=self.args.cluster,
-            variable='osd_mount_options_{fstype}'.format(
-                fstype=self.args.fs_type,
-            ),
-        )
-        if self.mount_options is None:
-            self.mount_options = get_conf(
-                cluster=self.args.cluster,
-                variable='osd_fs_mount_options_{fstype}'.format(
-                    fstype=self.args.fs_type,
-                ),
-            )
-        else:
-            # remove whitespaces
-            self.mount_options = "".join(self.mount_options.split())
+        self.mount_options = get_mount_options(cluster=self.args.cluster,
+                                               fs_type=self.args.fs_type)
 
         if self.args.osd_uuid is None:
             self.args.osd_uuid = str(uuid.uuid4())
@@ -2753,7 +2787,7 @@ def mkfs(
                 '--osd-uuid', fsid,
                 '--keyring', os.path.join(path, 'keyring'),
                 '--setuser', get_ceph_user(),
-                '--setgroup', get_ceph_user(),
+                '--setgroup', get_ceph_group(),
             ],
         )
     else:
@@ -2865,6 +2899,67 @@ def move_mount(
     )
 
 
+#
+# For upgrade purposes, to make sure there are no competing units,
+# both --runtime unit and the default should be disabled. There can be
+# two units at the same time: one with --runtime and another without
+# it. If, for any reason (manual or ceph-disk) the two units co-exist
+# they will compete with each other.
+#
+def systemd_disable(
+    path,
+    osd_id,
+):
+    # ensure there is no duplicate ceph-osd@.service
+    for style in ([], ['--runtime']):
+        command_check_call(
+            [
+                'systemctl',
+                'disable',
+                'ceph-osd@{osd_id}'.format(osd_id=osd_id),
+            ] + style,
+        )
+
+
+def systemd_start(
+    path,
+    osd_id,
+):
+    systemd_disable(path, osd_id)
+    if is_mounted(path):
+        style = ['--runtime']
+    else:
+        style = []
+    command_check_call(
+        [
+            'systemctl',
+            'enable',
+            'ceph-osd@{osd_id}'.format(osd_id=osd_id),
+        ] + style,
+    )
+    command_check_call(
+        [
+            'systemctl',
+            'start',
+            'ceph-osd@{osd_id}'.format(osd_id=osd_id),
+        ],
+    )
+
+
+def systemd_stop(
+    path,
+    osd_id,
+):
+    systemd_disable(path, osd_id)
+    command_check_call(
+        [
+            'systemctl',
+            'stop',
+            'ceph-osd@{osd_id}'.format(osd_id=osd_id),
+        ],
+    )
+
+
 def start_daemon(
     cluster,
     osd_id,
@@ -2908,29 +3003,7 @@ def start_daemon(
                 ],
             )
         elif os.path.exists(os.path.join(path, 'systemd')):
-            # ensure there is no duplicate ceph-osd@.service
-            command_check_call(
-                [
-                    'systemctl',
-                    'disable',
-                    'ceph-osd@{osd_id}'.format(osd_id=osd_id),
-                ],
-            )
-            command_check_call(
-                [
-                    'systemctl',
-                    'enable',
-                    '--runtime',
-                    'ceph-osd@{osd_id}'.format(osd_id=osd_id),
-                ],
-            )
-            command_check_call(
-                [
-                    'systemctl',
-                    'start',
-                    'ceph-osd@{osd_id}'.format(osd_id=osd_id),
-                ],
-            )
+            systemd_start(path, osd_id)
         else:
             raise Error('{cluster} osd.{osd_id} is not tagged '
                         'with an init system'.format(
@@ -2974,21 +3047,7 @@ def stop_daemon(
                 ],
             )
         elif os.path.exists(os.path.join(path, 'systemd')):
-            command_check_call(
-                [
-                    'systemctl',
-                    'disable',
-                    '--runtime',
-                    'ceph-osd@{osd_id}'.format(osd_id=osd_id),
-                ],
-            )
-            command_check_call(
-                [
-                    'systemctl',
-                    'stop',
-                    'ceph-osd@{osd_id}'.format(osd_id=osd_id),
-                ],
-            )
+            systemd_stop(path, osd_id)
         else:
             raise Error('{cluster} osd.{osd_id} is not tagged with an init '
                         ' system'.format(cluster=cluster, osd_id=osd_id))
@@ -3069,24 +3128,7 @@ def mount_activate(
 
     # TODO always using mount options from cluster=ceph for
     # now; see http://tracker.newdream.net/issues/3253
-    mount_options = get_conf(
-        cluster='ceph',
-        variable='osd_mount_options_{fstype}'.format(
-            fstype=fstype,
-        ),
-    )
-
-    if mount_options is None:
-        mount_options = get_conf(
-            cluster='ceph',
-            variable='osd_fs_mount_options_{fstype}'.format(
-                fstype=fstype,
-            ),
-        )
-
-    # remove whitespaces from mount_options
-    if mount_options is not None:
-        mount_options = "".join(mount_options.split())
+    mount_options = get_mount_options(cluster='ceph', fs_type=fstype)
 
     path = mount(dev=dev, fstype=fstype, options=mount_options)
 
@@ -3591,15 +3633,17 @@ def _deallocate_osd_id(cluster, osd_id):
     ])
 
 
-def _remove_lockbox(uuid):
+def _remove_lockbox(uuid, cluster):
     command([
         'ceph',
+        '--cluster', cluster,
         'auth',
         'del',
         'client.osd-lockbox.' + uuid,
     ])
     command([
         'ceph',
+        '--cluster', cluster,
         'config-key',
         'del',
         'dm-crypt/osd/' + uuid + '/luks',
@@ -3697,7 +3741,7 @@ def main_destroy_locked(args):
         for name in Space.NAMES:
             if target_dev.get(name + '_uuid'):
                 dmcrypt_unmap(target_dev[name + '_uuid'])
-        _remove_lockbox(target_dev['uuid'])
+        _remove_lockbox(target_dev['uuid'], args.cluster)
 
     # Check zap flag. If we found zap flag, we need to find device for
     # destroy this osd data.
@@ -4171,9 +4215,11 @@ def list_devices():
 
                 fs_type = get_dev_fs(dev_to_mount)
                 if fs_type is not None:
+                    mount_options = get_mount_options(cluster='ceph',
+                                                      fs_type=fs_type)
                     try:
                         tpath = mount(dev=dev_to_mount,
-                                      fstype=fs_type, options='')
+                                      fstype=fs_type, options=mount_options)
                         try:
                             for name in Space.NAMES:
                                 space_uuid = get_oneliner(tpath,
@@ -4986,7 +5032,9 @@ def main(argv):
         path = os.environ.get('PATH', os.defpath)
         os.environ['PATH'] = args.prepend_to_path + ":" + path
 
-    setup_statedir(args.statedir)
+    if args.func.__name__ != 'main_trigger':
+        # trigger may run when statedir is unavailable and does not use it
+        setup_statedir(args.statedir)
     setup_sysconfdir(args.sysconfdir)
 
     global CEPH_PREF_USER

@@ -136,9 +136,6 @@ class Thrasher:
         except Exception:
             manager.raw_cluster_cmd('--', 'mon', 'tell', '*', 'injectargs',
                                     '--mon-osd-down-out-interval 0')
-        self.thread = gevent.spawn(self.do_thrash)
-        if self.sighup_delay:
-            self.sighup_thread = gevent.spawn(self.do_sighup)
         if self.config.get('powercycle') or not self.cmd_exists_on_osds("ceph-objectstore-tool"):
             self.ceph_objectstore_tool = False
             self.test_rm_past_intervals = False
@@ -153,6 +150,10 @@ class Thrasher:
                 self.config.get('ceph_objectstore_tool', True)
             self.test_rm_past_intervals = \
                 self.config.get('test_rm_past_intervals', True)
+        # spawn do_thrash
+        self.thread = gevent.spawn(self.do_thrash)
+        if self.sighup_delay:
+            self.sighup_thread = gevent.spawn(self.do_sighup)
 
     def cmd_exists_on_osds(self, cmd):
         allremotes = self.ceph_manager.ctx.cluster.only(\
@@ -222,12 +223,22 @@ class Thrasher:
                         break
                     log.debug("ceph-objectstore-tool binary not present, trying again")
 
-            proc = exp_remote.run(args=cmd, wait=True,
-                                  check_status=False, stdout=StringIO())
-            if proc.exitstatus:
-                raise Exception("ceph-objectstore-tool: "
-                                "exp list-pgs failure with status {ret}".
-                                format(ret=proc.exitstatus))
+            # ceph-objectstore-tool might bogusly fail with "OSD has the store locked"
+            # see http://tracker.ceph.com/issues/19556
+            with safe_while(sleep=15, tries=40, action="ceph-objectstore-tool --op list-pgs") as proceed:
+                while proceed():
+                    proc = exp_remote.run(args=cmd, wait=True,
+                                          check_status=False,
+                                          stdout=StringIO(), stderr=StringIO())
+                    if proc.exitstatus == 0:
+                        break
+                    elif proc.exitstatus == 1 and proc.stderr == "OSD has the store locked":
+                        continue
+                    else:
+                        raise Exception("ceph-objectstore-tool: "
+                                        "exp list-pgs failure with status {ret}".
+                                        format(ret=proc.exitstatus))
+
             pgs = proc.stdout.getvalue().split('\n')[:-1]
             if len(pgs) == 0:
                 self.log("No PGs found for osd.{osd}".format(osd=exp_osd))
@@ -1457,6 +1468,33 @@ class CephManager:
             self.log("waiting for scrub type %s" % (stype,))
             self.raw_cluster_cmd('pg', stype, self.get_pgid(pool, pgnum))
             time.sleep(10)
+
+    def wait_snap_trimming_complete(self, pool):
+        """
+        Wait for snap trimming on pool to end
+        """
+        POLL_PERIOD = 10
+        FATAL_TIMEOUT = 600
+        start = time.time()
+        poolnum = self.get_pool_num(pool)
+        poolnumstr = "%s." % (poolnum,)
+        while (True):
+            now = time.time()
+            if (now - start) > FATAL_TIMEOUT:
+                assert (now - start) < FATAL_TIMEOUT, \
+                    'failed to complete snap trimming before timeout'
+            all_stats = self.get_pg_stats()
+            trimming = False
+            for pg in all_stats:
+                if (poolnumstr in pg['pgid']) and ('snaptrim' in pg['state']):
+                    self.log("pg {pg} in trimming, state: {state}".format(
+                        pg=pg['pgid'],
+                        state=pg['state']))
+                    trimming = True
+            if not trimming:
+                break
+            self.log("{pool} still trimming, waiting".format(pool=pool))
+            time.sleep(POLL_PERIOD)
 
     def get_single_pg_stats(self, pgid):
         """

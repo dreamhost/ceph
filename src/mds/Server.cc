@@ -58,7 +58,6 @@
 #include "osd/OSDMap.h"
 
 #include <errno.h>
-#include <fcntl.h>
 
 #include <list>
 #include <iostream>
@@ -769,6 +768,7 @@ void Server::handle_client_reconnect(MClientReconnect *m)
 
   // notify client of success with an OPEN
   m->get_connection()->send_message(new MClientSession(CEPH_SESSION_OPEN));
+  session->last_cap_renew = ceph_clock_now(g_ceph_context);
   mds->clog->debug() << "reconnect by " << session->info.inst << " after " << delay << "\n";
   
   // snaprealms
@@ -2262,7 +2262,8 @@ CDentry* Server::prepare_stray_dentry(MDRequestRef& mdr, CInode *in)
 
   CDir *straydir = mdcache->get_stray_dir(in);
 
-  if (!check_fragment_space(mdr, straydir))
+  if (!mdr->client_request->is_replay() &&
+      !check_fragment_space(mdr, straydir))
     return NULL;
 
   straydn = mdcache->get_or_create_stray_dentry(in);
@@ -2886,7 +2887,7 @@ void Server::handle_client_open(MDRequestRef& mdr)
   int flags = req->head.args.open.flags;
   int cmode = ceph_flags_to_mode(flags);
 
-  bool need_auth = !file_mode_is_readonly(cmode) || (flags & O_TRUNC);
+  bool need_auth = !file_mode_is_readonly(cmode) || (flags & CEPH_O_TRUNC);
 
   dout(7) << "open on " << req->get_filepath() << dendl;
 
@@ -2922,8 +2923,8 @@ void Server::handle_client_open(MDRequestRef& mdr)
     // can only open non-regular inode with mode FILE_MODE_PIN, at least for now.
     cmode = CEPH_FILE_MODE_PIN;
     // the inode is symlink and client wants to follow it, ignore the O_TRUNC flag.
-    if (cur->inode.is_symlink() && !(flags & O_NOFOLLOW))
-      flags &= ~O_TRUNC;
+    if (cur->inode.is_symlink() && !(flags & CEPH_O_NOFOLLOW))
+      flags &= ~CEPH_O_TRUNC;
   }
 
   dout(10) << "open flags = " << flags
@@ -2937,16 +2938,16 @@ void Server::handle_client_open(MDRequestRef& mdr)
     respond_to_request(mdr, -ENXIO);                 // FIXME what error do we want?
     return;
     }*/
-  if ((flags & O_DIRECTORY) && !cur->inode.is_dir() && !cur->inode.is_symlink()) {
+  if ((flags & CEPH_O_DIRECTORY) && !cur->inode.is_dir() && !cur->inode.is_symlink()) {
     dout(7) << "specified O_DIRECTORY on non-directory " << *cur << dendl;
     respond_to_request(mdr, -EINVAL);
     return;
   }
 
-  if ((flags & O_TRUNC) && !cur->inode.is_file()) {
+  if ((flags & CEPH_O_TRUNC) && !cur->inode.is_file()) {
     dout(7) << "specified O_TRUNC on !(file|symlink) " << *cur << dendl;
     // we should return -EISDIR for directory, return -EINVAL for other non-regular
-    respond_to_request(mdr, cur->inode.is_dir() ? EISDIR : -EINVAL);
+    respond_to_request(mdr, cur->inode.is_dir() ? -EISDIR : -EINVAL);
     return;
   }
 
@@ -2981,7 +2982,7 @@ void Server::handle_client_open(MDRequestRef& mdr)
   }
 
   // O_TRUNC
-  if ((flags & O_TRUNC) && !mdr->has_completed) {
+  if ((flags & CEPH_O_TRUNC) && !mdr->has_completed) {
     assert(cur->is_auth());
 
     xlocks.insert(&cur->filelock);
@@ -3121,7 +3122,7 @@ void Server::handle_client_openc(MDRequestRef& mdr)
     return;
   }
 
-  if (!(req->head.args.open.flags & O_EXCL)) {
+  if (!(req->head.args.open.flags & CEPH_O_EXCL)) {
     int r = mdcache->path_traverse(mdr, NULL, NULL, req->get_filepath(),
 				   &mdr->dn[0], NULL, MDS_TRAVERSE_FORWARD);
     if (r > 0) return;
@@ -3144,7 +3145,7 @@ void Server::handle_client_openc(MDRequestRef& mdr)
     // r == -ENOENT
   }
 
-  bool excl = (req->head.args.open.flags & O_EXCL);
+  bool excl = (req->head.args.open.flags & CEPH_O_EXCL);
   set<SimpleLock*> rdlocks, wrlocks, xlocks;
   file_layout_t *dir_layout = NULL;
   CDentry *dn = rdlock_path_xlock_dentry(mdr, 0, rdlocks, wrlocks, xlocks,
@@ -3219,7 +3220,7 @@ void Server::handle_client_openc(MDRequestRef& mdr)
 
   if (!dnl->is_null()) {
     // it existed.  
-    assert(req->head.args.open.flags & O_EXCL);
+    assert(req->head.args.open.flags & CEPH_O_EXCL);
     dout(10) << "O_EXCL, target exists, failing with -EEXIST" << dendl;
     mdr->tracei = dnl->get_inode();
     mdr->tracedn = dn;
@@ -3378,7 +3379,8 @@ void Server::handle_client_readdir(MDRequestRef& mdr)
     max = dir->get_num_any();  // whatever, something big.
   unsigned max_bytes = req->head.args.readdir.max_bytes;
   if (!max_bytes)
-    max_bytes = 512 << 10;  // 512 KB?
+    // make sure at least one item can be encoded
+    max_bytes = (512 << 10) + g_conf->mds_max_xattr_pairs_size;
 
   // start final blob
   bufferlist dirbl;
@@ -4457,6 +4459,25 @@ void Server::handle_client_setxattr(MDRequestRef& mdr)
     return;
 
   map<string, bufferptr> *pxattrs = cur->get_projected_xattrs();
+  size_t len = req->get_data().length();
+  size_t inc = len + name.length();
+
+  // check xattrs kv pairs size
+  size_t cur_xattrs_size = 0;
+  for (const auto& p : *pxattrs) {
+    if ((flags & CEPH_XATTR_REPLACE) && (name.compare(p.first) == 0)) {
+      continue;
+    }
+    cur_xattrs_size += p.first.length() + p.second.length();
+  }
+
+  if (((cur_xattrs_size + inc) > g_conf->mds_max_xattr_pairs_size)) {
+    dout(10) << "xattr kv pairs size too big. cur_xattrs_size " 
+             << cur_xattrs_size << ", inc " << inc << dendl;
+    respond_to_request(mdr, -ENOSPC);
+    return;
+  }
+
   if ((flags & CEPH_XATTR_CREATE) && pxattrs->count(name)) {
     dout(10) << "setxattr '" << name << "' XATTR_CREATE and EEXIST on " << *cur << dendl;
     respond_to_request(mdr, -EEXIST);
@@ -4468,7 +4489,6 @@ void Server::handle_client_setxattr(MDRequestRef& mdr)
     return;
   }
 
-  int len = req->get_data().length();
   dout(10) << "setxattr '" << name << "' len " << len << " on " << *cur << dendl;
 
   // project update
@@ -4674,9 +4694,6 @@ void Server::handle_client_mknod(MDRequestRef& mdr)
       newi->filelock.set_state(LOCK_EXCL);
       newi->authlock.set_state(LOCK_EXCL);
       newi->xattrlock.set_state(LOCK_EXCL);
-      cap->issue_norevoke(CEPH_CAP_AUTH_EXCL|CEPH_CAP_AUTH_SHARED|
-			  CEPH_CAP_XATTR_EXCL|CEPH_CAP_XATTR_SHARED|
-			  CEPH_CAP_ANY_FILE_WR);
     }
   }
 
@@ -4772,8 +4789,6 @@ void Server::handle_client_mkdir(MDRequestRef& mdr)
     newi->filelock.set_state(LOCK_EXCL);
     newi->authlock.set_state(LOCK_EXCL);
     newi->xattrlock.set_state(LOCK_EXCL);
-    cap->issue_norevoke(CEPH_CAP_AUTH_EXCL|CEPH_CAP_AUTH_SHARED|
-			CEPH_CAP_XATTR_EXCL|CEPH_CAP_XATTR_SHARED);
   }
 
   // make sure this inode gets into the journal
@@ -7947,7 +7962,8 @@ void Server::handle_client_lssnap(MDRequestRef& mdr)
     max_entries = infomap.size();
   int max_bytes = req->head.args.readdir.max_bytes;
   if (!max_bytes)
-    max_bytes = 512 << 10;
+    // make sure at least one item can be encoded
+    max_bytes = (512 << 10) + g_conf->mds_max_xattr_pairs_size;
 
   __u64 last_snapid = 0;
   string offset_str = req->get_path2();

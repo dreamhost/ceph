@@ -861,6 +861,15 @@ public:
 	  ceph_clock_now(cct),
 	  entity_inst_t())));
   }
+
+  Mutex snap_sleep_lock;
+  SafeTimer snap_sleep_timer;
+
+  Mutex scrub_sleep_lock;
+  SafeTimer scrub_sleep_timer;
+
+  AsyncReserver<spg_t> snap_reserver;
+
   void queue_for_scrub(PG *pg) {
     op_wq.queue(
       make_pair(
@@ -868,7 +877,7 @@ public:
 	PGQueueable(
 	  PGScrub(pg->get_osdmap()->get_epoch()),
 	  cct->_conf->osd_scrub_cost,
-	  pg->get_scrub_priority(),
+	  pg->scrubber.priority,
 	  ceph_clock_now(cct),
 	  entity_inst_t())));
   }
@@ -1949,6 +1958,10 @@ protected:
   bool  _have_pg(spg_t pgid);
   PG   *_lookup_lock_pg_with_map_lock_held(spg_t pgid);
   PG   *_lookup_lock_pg(spg_t pgid);
+public:
+  PG   *lookup_lock_pg(spg_t pgid);
+
+protected:
   PG   *_lookup_pg(spg_t pgid);
   PG   *_open_lock_pg(OSDMapRef createmap,
 		      spg_t pg, bool no_lockdep_check=false);

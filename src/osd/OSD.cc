@@ -254,6 +254,14 @@ OSDService::OSDService(OSD *osd) :
   remote_reserver(&reserver_finisher, cct->_conf->osd_max_backfills,
 		  cct->_conf->osd_min_recovery_priority),
   pg_temp_lock("OSDService::pg_temp_lock"),
+  snap_sleep_lock("OSDService::snap_sleep_lock"),
+  snap_sleep_timer(
+    osd->client_messenger->cct, snap_sleep_lock, false /* relax locking */),
+  scrub_sleep_lock("OSDService::scrub_sleep_lock"),
+  scrub_sleep_timer(
+    osd->client_messenger->cct, scrub_sleep_lock, false /* relax locking */),
+  snap_reserver(&reserver_finisher,
+		cct->_conf->osd_max_trimming_pgs),
   map_cache_lock("OSDService::map_lock"),
   map_cache(cct, cct->_conf->osd_map_cache_size),
   map_bl_cache(cct->_conf->osd_map_cache_size),
@@ -482,6 +490,17 @@ void OSDService::shutdown()
     Mutex::Locker l(backfill_request_lock);
     backfill_request_timer.shutdown();
   }
+
+  {
+    Mutex::Locker l(snap_sleep_lock);
+    snap_sleep_timer.shutdown();
+  }
+
+  {
+    Mutex::Locker l(scrub_sleep_lock);
+    scrub_sleep_timer.shutdown();
+  }
+
   osdmap = OSDMapRef();
   next_osdmap = OSDMapRef();
 }
@@ -493,6 +512,8 @@ void OSDService::init()
   objecter->set_client_incarnation(0);
   watch_timer.init();
   agent_timer.init();
+  snap_sleep_timer.init();
+  scrub_sleep_timer.init();
 
   agent_thread.create("osd_srv_agent");
 }
@@ -3102,6 +3123,11 @@ PG *OSD::_lookup_lock_pg(spg_t pgid)
   PG *pg = pg_map[pgid];
   pg->lock();
   return pg;
+}
+
+PG *OSD::lookup_lock_pg(spg_t pgid)
+{
+  return _lookup_lock_pg(pgid);
 }
 
 
@@ -6658,7 +6684,8 @@ void OSD::handle_osd_map(MOSDMap *m)
     session->put();
 
   // share with the objecter
-  service.objecter->handle_osd_map(m);
+  if (!is_preboot())
+    service.objecter->handle_osd_map(m);
 
   epoch_t first = m->get_first();
   epoch_t last = m->get_last();
@@ -8990,6 +9017,8 @@ const char** OSD::get_tracked_conf_keys() const
     "clog_to_graylog_port",
     "host",
     "fsid",
+    "osd_client_message_size_cap",
+    "osd_client_message_cap",
     NULL
   };
   return KEYS;
@@ -9005,6 +9034,9 @@ void OSD::handle_conf_change(const struct md_config_t *conf,
   if (changed.count("osd_min_recovery_priority")) {
     service.local_reserver.set_min_priority(cct->_conf->osd_min_recovery_priority);
     service.remote_reserver.set_min_priority(cct->_conf->osd_min_recovery_priority);
+  }
+  if (changed.count("osd_max_trimming_pgs")) {
+    service.snap_reserver.set_max(cct->_conf->osd_max_trimming_pgs);
   }
   if (changed.count("osd_op_complaint_time") ||
       changed.count("osd_op_log_threshold")) {
@@ -9046,6 +9078,22 @@ void OSD::handle_conf_change(const struct md_config_t *conf,
     }
   }
 #endif
+
+  if (changed.count("osd_client_message_cap")) {
+    uint64_t newval = cct->_conf->osd_client_message_cap;
+    Messenger::Policy pol = client_messenger->get_policy(entity_name_t::TYPE_CLIENT);
+    if (pol.throttler_messages && newval > 0) {
+      pol.throttler_messages->reset_max(newval);
+    }
+  }
+  if (changed.count("osd_client_message_size_cap")) {
+    uint64_t newval = cct->_conf->osd_client_message_size_cap;
+    Messenger::Policy pol = client_messenger->get_policy(entity_name_t::TYPE_CLIENT);
+    if (pol.throttler_bytes && newval > 0) {
+      pol.throttler_bytes->reset_max(newval);
+    }
+  }
+
   check_config();
 }
 
