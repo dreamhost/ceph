@@ -667,7 +667,7 @@ public:
 
   virtual bool should_get_stats() { return false; }
 
-  const string name() override { return "get_usage"; }
+  const string name() override { return "get_self_usage"; }
   uint32_t op_mask() override { return RGW_OP_TYPE_READ; }
 };
 
