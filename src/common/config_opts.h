@@ -231,7 +231,7 @@ OPTION(mon_osd_auto_mark_new_in, OPT_BOOL, true)      // mark booting new osds '
 OPTION(mon_osd_down_out_interval, OPT_INT, 300) // seconds
 OPTION(mon_osd_down_out_subtree_limit, OPT_STR, "rack")   // smallest crush unit/type that we will not automatically mark out
 OPTION(mon_osd_min_up_ratio, OPT_DOUBLE, .3)    // min osds required to be up to mark things down
-OPTION(mon_osd_min_in_ratio, OPT_DOUBLE, .3)   // min osds required to be in to mark things out
+OPTION(mon_osd_min_in_ratio, OPT_DOUBLE, .75)   // min osds required to be in to mark things out
 OPTION(mon_osd_max_op_age, OPT_DOUBLE, 32)     // max op age before we get concerned (make it a power of 2)
 OPTION(mon_osd_max_split_count, OPT_INT, 32) // largest number of PGs per "involved" OSD to let split create
 OPTION(mon_osd_allow_primary_temp, OPT_BOOL, false)  // allow primary_temp to be set in the osdmap
@@ -273,6 +273,7 @@ OPTION(mon_crush_min_required_version, OPT_STR, "firefly")
 OPTION(mon_warn_on_crush_straw_calc_version_zero, OPT_BOOL, true) // warn if crush straw_calc_version==0
 OPTION(mon_warn_on_osd_down_out_interval_zero, OPT_BOOL, true) // warn if 'mon_osd_down_out_interval == 0'
 OPTION(mon_warn_on_cache_pools_without_hit_sets, OPT_BOOL, true)
+OPTION(mon_warn_osd_usage_min_max_delta, OPT_FLOAT, 0) // warn if difference between min and max OSD utilizations exceeds specified amount
 OPTION(mon_min_osdmap_epochs, OPT_INT, 500)
 OPTION(mon_max_pgmap_epochs, OPT_INT, 500)
 OPTION(mon_max_log_epochs, OPT_INT, 500)
@@ -430,6 +431,8 @@ OPTION(objecter_inject_no_watch_ping, OPT_BOOL, false)   // suppress watch pings
 
 // Max number of deletes at once in a single Filer::purge call
 OPTION(filer_max_purge_ops, OPT_U32, 10)
+// Max number of truncate at once in a single Filer::truncate call
+OPTION(filer_max_truncate_ops, OPT_U32, 128)
 
 OPTION(journaler_allow_split_entries, OPT_BOOL, true)
 OPTION(journaler_write_head_interval, OPT_INT, 15)
@@ -731,6 +734,7 @@ OPTION(osd_heartbeat_interval, OPT_INT, 6)       // (seconds) how often we ping 
 OPTION(osd_heartbeat_grace, OPT_INT, 20)         // (seconds) how long before we decide a peer has failed
 OPTION(osd_heartbeat_min_peers, OPT_INT, 10)     // minimum number of peers
 OPTION(osd_heartbeat_use_min_delay_socket, OPT_BOOL, false) // prio the heartbeat tcp socket and set dscp as CS6 on it if true
+OPTION(osd_heartbeat_min_size, OPT_INT, 2000) // the minimum size of OSD heartbeat messages to send
 
 // max number of parallel snap trims/pg
 OPTION(osd_pg_max_concurrent_snap_trims, OPT_U64, 2)
@@ -779,7 +783,6 @@ OPTION(osd_deep_scrub_interval, OPT_FLOAT, 60*60*24*7) // once a week
 OPTION(osd_deep_scrub_randomize_ratio, OPT_FLOAT, 0.15) // scrubs will randomly become deep scrubs at this rate (0.15 -> 15% of scrubs are deep)
 OPTION(osd_deep_scrub_stride, OPT_INT, 524288)
 OPTION(osd_deep_scrub_update_digest_min_age, OPT_INT, 2*60*60)   // objects must be this old (seconds) before we update the whole-object digest on scrub
-OPTION(osd_scan_list_ping_tp_interval, OPT_U64, 100)
 OPTION(osd_class_dir, OPT_STR, CEPH_LIBDIR "/rados-classes") // where rados plugins are stored
 OPTION(osd_open_classes_on_start, OPT_BOOL, true)
 OPTION(osd_check_for_log_corruption, OPT_BOOL, false)
@@ -822,6 +825,8 @@ OPTION(osd_failsafe_nearfull_ratio, OPT_FLOAT, .90) // what % full makes an OSD 
 
 OPTION(osd_pg_object_context_cache_count, OPT_INT, 64)
 OPTION(osd_tracing, OPT_BOOL, false) // true if LTTng-UST tracepoints should be enabled
+
+OPTION(osd_hack_prune_past_intervals, OPT_BOOL, false)  // simplify past intervals on startup -- last ditch method of reducing memory usage for very unhappy clusters
 
 // determines whether PGLog::check() compares written out log to stored log
 OPTION(osd_debug_pg_log_writeout, OPT_BOOL, false)
@@ -888,6 +893,7 @@ OPTION(osd_recovery_op_warn_multiple, OPT_U32, 16)
 
 // Max time to wait between notifying mon of shutdown and shutting down
 OPTION(osd_mon_shutdown_timeout, OPT_DOUBLE, 5)
+OPTION(osd_shutdown_pgref_assert, OPT_BOOL, false) // crash if the OSD has stray PG refs on shutdown
 
 OPTION(osd_max_object_size, OPT_U64, 100*1024L*1024L*1024L) // OSD's maximum object size
 OPTION(osd_max_object_name_len, OPT_U32, 2048) // max rados object name len
@@ -1434,6 +1440,8 @@ OPTION(rgw_user_default_quota_max_size, OPT_LONGLONG, -1) // Max size of object 
 OPTION(rgw_multipart_min_part_size, OPT_INT, 5 * 1024 * 1024) // min size for each part (except for last one) in multipart upload
 OPTION(rgw_multipart_part_upload_limit, OPT_INT, 10000) // parts limit in multipart upload
 
+OPTION(rgw_mp_lock_max_time, OPT_INT, 600) // multipart-upload xlock timeout in seconds
+
 OPTION(rgw_max_slo_entries, OPT_INT, 1000) // default number of max entries in slo
 
 OPTION(rgw_olh_pending_timeout_sec, OPT_INT, 3600) // time until we retire a pending olh change
@@ -1452,7 +1460,6 @@ OPTION(rgw_md_notify_interval_msec, OPT_INT, 200) // metadata changes notificati
 OPTION(rgw_run_sync_thread, OPT_BOOL, true) // whether radosgw (not radosgw-admin) spawns the sync thread
 OPTION(rgw_sync_lease_period, OPT_INT, 120) // time in second for lease that rgw takes on a specific log (or log shard)
 
-OPTION(rgw_realm_reconfigure_delay, OPT_DOUBLE, 2) // seconds to wait before reloading realm configuration
 OPTION(rgw_period_push_interval, OPT_DOUBLE, 2) // seconds to wait before retrying "period push"
 OPTION(rgw_period_push_interval_max, OPT_DOUBLE, 30) // maximum interval after exponential backoff
 
@@ -1470,3 +1477,5 @@ OPTION(throttler_perf_counter, OPT_BOOL, true) // enable/disable throttler perf 
 OPTION(internal_safe_to_start_threads, OPT_BOOL, false)
 
 OPTION(debug_deliberately_leak_memory, OPT_BOOL, false)
+
+OPTION(rgw_swift_custom_header, OPT_STR, "") // option to enable swift custom headers

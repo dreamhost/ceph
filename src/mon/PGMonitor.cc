@@ -958,7 +958,7 @@ void PGMonitor::check_osd_map(epoch_t epoch)
 }
 
 void PGMonitor::register_pg(OSDMap *osdmap,
-                            pg_pool_t& pool, pg_t pgid, epoch_t epoch,
+                            pg_t pgid, epoch_t epoch,
                             bool new_pool)
 {
   pg_t parent;
@@ -968,7 +968,7 @@ void PGMonitor::register_pg(OSDMap *osdmap,
     parent = pgid;
     while (1) {
       // remove most significant bit
-      int msb = pool.calc_bits_of(parent.ps());
+      int msb = pg_pool_t::calc_bits_of(parent.ps());
       if (!msb)
 	break;
       parent.set_ps(parent.ps() & ~(1<<(msb-1)));
@@ -1078,7 +1078,7 @@ bool PGMonitor::register_new_pgs()
 	continue;
       }
       created++;
-      register_pg(osdmap, pool, pgid, pool.get_last_change(), new_pool);
+      register_pg(osdmap, pgid, pool.get_last_change(), new_pool);
     }
   }
 
@@ -1416,15 +1416,17 @@ int64_t PGMonitor::get_rule_avail(OSDMap& osdmap, int ruleno) const
 {
   map<int,float> wm;
   int r = osdmap.crush->get_rule_weight_osd_map(ruleno, &wm);
-  if (r < 0)
+  if (r < 0) {
     return r;
-
-  if(wm.empty())
+  }
+  if (wm.empty()) {
     return 0;
+  }
 
   int64_t min = -1;
   for (map<int,float>::iterator p = wm.begin(); p != wm.end(); ++p) {
-    ceph::unordered_map<int32_t,osd_stat_t>::const_iterator osd_info = pg_map.osd_stat.find(p->first);
+    ceph::unordered_map<int32_t,osd_stat_t>::const_iterator osd_info =
+      pg_map.osd_stat.find(p->first);
     if (osd_info != pg_map.osd_stat.end()) {
       if (osd_info->second.kb == 0 || p->second == 0) {
 	// osd must be out, hence its stats have been zeroed
@@ -1434,10 +1436,14 @@ int64_t PGMonitor::get_rule_avail(OSDMap& osdmap, int ruleno) const
 	// calculate proj below.
 	continue;
       }
-      int64_t proj = (int64_t)((double)((osd_info->second).kb_avail * 1024ull) /
-                     (double)p->second);
-      if (min < 0 || proj < min)
+      double unusable = (double)osd_info->second.kb *
+	(1.0 - g_conf->mon_osd_full_ratio);
+      double avail = MAX(0.0, (double)osd_info->second.kb_avail - unusable);
+      avail *= 1024.0;
+      int64_t proj = (int64_t)(avail / (double)p->second);
+      if (min < 0 || proj < min) {
 	min = proj;
+      }
     } else {
       dout(0) << "Cannot get stat of OSD " << p->first << dendl;
     }
@@ -1979,10 +1985,7 @@ bool PGMonitor::prepare_command(MonOpRequestRef op)
       goto reply;
     }
     {
-      pg_stat_t& s = pending_inc.pg_stat_updates[pgid];
-      s.state = PG_STATE_CREATING;
-      s.created = epoch;
-      s.last_change = ceph_clock_now(g_ceph_context);
+      register_pg(&mon->osdmon()->osdmap, pgid, epoch, true);
     }
     ss << "pg " << pgidstr << " now creating, ok";
     goto update;
@@ -2333,6 +2336,32 @@ void PGMonitor::get_health(list<pair<health_status_t,string> >& summary,
 	summary.push_back(make_pair(HEALTH_WARN, ss2.str()));
 	detail->push_back(make_pair(HEALTH_WARN, ss2.str()));
       }
+    }
+  }
+
+  if (g_conf->mon_warn_osd_usage_min_max_delta) {
+    float max_osd_usage = 0.0, min_osd_usage = 1.0;
+    for (auto p = pg_map.osd_stat.begin(); p != pg_map.osd_stat.end(); ++p) {
+      // kb should never be 0, but avoid divide by zero in case of corruption
+      if (p->second.kb <= 0)
+        continue;
+      float usage = ((float)p->second.kb_used) / ((float)p->second.kb);
+      if (usage > max_osd_usage)
+        max_osd_usage = usage;
+      if (usage < min_osd_usage)
+        min_osd_usage = usage;
+    }
+    float diff = max_osd_usage - min_osd_usage;
+    if (diff > g_conf->mon_warn_osd_usage_min_max_delta) {
+      ostringstream ss;
+      ss << "difference between min (" << roundf(min_osd_usage*1000.0)/10.0
+	 << "%) and max (" << roundf(max_osd_usage*1000.0)/10.0
+	 << "%) osd usage " << roundf(diff*1000.0)/10.0 << "% > "
+	 << roundf(g_conf->mon_warn_osd_usage_min_max_delta*1000.0)/10.0
+	 << "% (mon_warn_osd_usage_min_max_delta)";
+      summary.push_back(make_pair(HEALTH_WARN, ss.str()));
+      if (detail)
+        detail->push_back(make_pair(HEALTH_WARN, ss.str()));
     }
   }
 

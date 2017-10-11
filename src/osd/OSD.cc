@@ -743,9 +743,9 @@ void OSDService::check_nearfull_warning(const osd_stat_t &osd_stat)
   }
   last_msg = now;
   if (cur_state == FULL)
-    clog->error() << "OSD full dropping all updates " << (int)(ratio * 100) << "% full";
+    clog->error() << "OSD full dropping all updates " << (int)roundf(ratio * 100) << "% full";
   else
-    clog->warn() << "OSD near full (" << (int)(ratio * 100) << "%)";
+    clog->warn() << "OSD near full (" << (int)roundf(ratio * 100) << "%)";
 }
 
 bool OSDService::check_failsafe_full()
@@ -2754,7 +2754,9 @@ int OSD::shutdown()
 #ifdef PG_DEBUG_REFS
 	p->second->dump_live_ids();
 #endif
-        assert(0);
+	if (cct->_conf->osd_shutdown_pgref_assert) {
+	  assert(0);
+	}
       }
       p->second->unlock();
       p->second->put("PGMap");
@@ -3952,8 +3954,8 @@ void OSD::handle_osd_ping(MOSDPing *m)
 
       Message *r = new MOSDPing(monc->get_fsid(),
 				curmap->get_epoch(),
-				MOSDPing::PING_REPLY,
-				m->stamp);
+				MOSDPing::PING_REPLY, m->stamp,
+				cct->_conf->osd_heartbeat_min_size);
       m->get_connection()->send_message(r);
 
       if (curmap->is_up(from)) {
@@ -3970,7 +3972,8 @@ void OSD::handle_osd_ping(MOSDPing *m)
 	Message *r = new MOSDPing(monc->get_fsid(),
 				  curmap->get_epoch(),
 				  MOSDPing::YOU_DIED,
-				  m->stamp);
+				  m->stamp,
+				  cct->_conf->osd_heartbeat_min_size);
 	m->get_connection()->send_message(r);
       }
     }
@@ -4147,14 +4150,14 @@ void OSD::heartbeat()
     dout(30) << "heartbeat sending ping to osd." << peer << dendl;
     i->second.con_back->send_message(new MOSDPing(monc->get_fsid(),
 					  service.get_osdmap()->get_epoch(),
-					  MOSDPing::PING,
-					  now));
+					  MOSDPing::PING, now,
+					  cct->_conf->osd_heartbeat_min_size));
 
     if (i->second.con_front)
       i->second.con_front->send_message(new MOSDPing(monc->get_fsid(),
 					     service.get_osdmap()->get_epoch(),
-						     MOSDPing::PING,
-						     now));
+					     MOSDPing::PING, now,
+					  cct->_conf->osd_heartbeat_min_size));
   }
 
   dout(30) << "heartbeat check" << dendl;
@@ -6588,6 +6591,7 @@ struct C_OnMapCommit : public Context {
     : osd(o), first(f), last(l), msg(m) {}
   void finish(int r) {
     osd->_committed_osd_maps(first, last, msg);
+    msg->put();
   }
 };
 
@@ -7104,7 +7108,6 @@ void OSD::_committed_osd_maps(epoch_t first, epoch_t last, MOSDMap *m)
   else if (do_restart)
     start_boot();
 
-  m->put();
 }
 
 void OSD::check_osdmap_features(ObjectStore *fs)
@@ -8727,9 +8730,9 @@ void OSD::ShardedOpWQ::_process(uint32_t thread_index, heartbeat_handle_d *hb ) 
   assert(NULL != sdata);
   sdata->sdata_op_ordering_lock.Lock();
   if (sdata->pqueue->empty()) {
-    sdata->sdata_op_ordering_lock.Unlock();
     osd->cct->get_heartbeat_map()->reset_timeout(hb, 4, 0);
     sdata->sdata_lock.Lock();
+    sdata->sdata_op_ordering_lock.Unlock();
     sdata->sdata_cond.WaitInterval(osd->cct, sdata->sdata_lock, utime_t(2, 0));
     sdata->sdata_lock.Unlock();
     sdata->sdata_op_ordering_lock.Lock();
@@ -9019,6 +9022,8 @@ const char** OSD::get_tracked_conf_keys() const
     "fsid",
     "osd_client_message_size_cap",
     "osd_client_message_cap",
+    "osd_heartbeat_min_size",
+    "osd_heartbeat_interval",
     NULL
   };
   return KEYS;

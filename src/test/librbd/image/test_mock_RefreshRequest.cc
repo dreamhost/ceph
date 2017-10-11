@@ -97,12 +97,10 @@ public:
   typedef RefreshRequest<MockRefreshImageCtx> MockRefreshRequest;
   typedef RefreshParentRequest<MockRefreshImageCtx> MockRefreshParentRequest;
 
-  void expect_set_require_lock_on_read(MockRefreshImageCtx &mock_image_ctx) {
-    EXPECT_CALL(*mock_image_ctx.aio_work_queue, set_require_lock_on_read());
-  }
-
-  void expect_clear_require_lock_on_read(MockRefreshImageCtx &mock_image_ctx) {
-    EXPECT_CALL(*mock_image_ctx.aio_work_queue, clear_require_lock_on_read());
+  void expect_set_require_lock(MockRefreshImageCtx &mock_image_ctx,
+                               AioDirection direction, bool enabled) {
+    EXPECT_CALL(*mock_image_ctx.aio_work_queue, set_require_lock(direction,
+                                                                 enabled));
   }
 
   void expect_v1_read_header(MockRefreshImageCtx &mock_image_ctx, int r) {
@@ -755,7 +753,7 @@ TEST_F(TestMockImageRefreshRequest, EnableJournalWithoutExclusiveLock) {
   expect_get_mutable_metadata(mock_image_ctx, 0);
   expect_get_flags(mock_image_ctx, 0);
   expect_refresh_parent_is_required(mock_refresh_parent_request, false);
-  expect_set_require_lock_on_read(mock_image_ctx);
+  expect_set_require_lock(mock_image_ctx, AIO_DIRECTION_BOTH, true);
 
   C_SaferCond ctx;
   MockRefreshRequest *req = new MockRefreshRequest(mock_image_ctx, false, false, &ctx);
@@ -797,7 +795,9 @@ TEST_F(TestMockImageRefreshRequest, DisableJournal) {
   expect_get_flags(mock_image_ctx, 0);
   expect_refresh_parent_is_required(mock_refresh_parent_request, false);
   expect_block_writes(mock_image_ctx, 0);
-  expect_clear_require_lock_on_read(mock_image_ctx);
+  if (!mock_image_ctx.clone_copy_on_read) {
+    expect_set_require_lock(mock_image_ctx, AIO_DIRECTION_READ, false);
+  }
   expect_close_journal(mock_image_ctx, *mock_journal, 0);
   expect_unblock_writes(mock_image_ctx);
 

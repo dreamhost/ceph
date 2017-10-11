@@ -112,7 +112,8 @@ namespace librbd {
                 uint8_t journal_splay_width,
                 const std::string &journal_pool,
                 const std::string &non_primary_global_image_id,
-                const std::string &primary_mirror_uuid);
+                const std::string &primary_mirror_uuid,
+                bool negotiate_features);
   int clone(IoCtx& p_ioctx, const char *p_name, const char *p_snap_name,
 	    IoCtx& c_ioctx, const char *c_name,
 	    uint64_t features, int *c_order,
@@ -215,7 +216,7 @@ namespace librbd {
   int mirror_image_status_summary(IoCtx& io_ctx,
       std::map<mirror_image_status_state_t, int> *states);
 
-  int mirror_image_enable(ImageCtx *ictx);
+  int mirror_image_enable(ImageCtx *ictx, bool relax_same_pool_parent_check);
   int mirror_image_disable(ImageCtx *ictx, bool force);
   int mirror_image_promote(ImageCtx *ictx, bool force);
   int mirror_image_demote(ImageCtx *ictx);

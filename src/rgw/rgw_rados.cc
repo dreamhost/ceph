@@ -1,3 +1,4 @@
+
 // -*- mode:C++; tab-width:8; c-basic-offset:2; indent-tabs-mode:t -*-
 // vim: ts=8 sw=2 smarttab
 
@@ -287,7 +288,6 @@ void RGWZoneGroup::post_process_params()
   for (map<string, RGWZone>::iterator iter = zones.begin(); iter != zones.end(); ++iter) {
     RGWZone& zone = iter->second;
     zone.log_data = log_data;
-    zone.log_meta = (is_master && zone.id == master_zone);
 
     RGWZoneParams zone_params(zone.id, zone.name);
     int ret = zone_params.init(cct, store);
@@ -385,7 +385,9 @@ int RGWSystemMetaObj::init(CephContext *_cct, RGWRados *_store, bool setup_obj, 
     } else if (!old_format) {
       r = read_id(name, id);
       if (r < 0) {
-        ldout(cct, 0) << "error in read_id for object name: " << name << " : " << cpp_strerror(-r) << dendl;
+        if (r != -ENOENT) {
+          ldout(cct, 0) << "error in read_id for object name: " << name << " : " << cpp_strerror(-r) << dendl;
+        }
         return r;
       }
     }
@@ -913,11 +915,6 @@ int RGWPeriod::get_zonegroup(RGWZoneGroup& zonegroup, const string& zonegroup_id
   return -ENOENT;
 }
 
-bool RGWPeriod::is_single_zonegroup(CephContext *cct, RGWRados *store)
-{
-  return (period_map.zonegroups.size() == 1);
-}
-
 const string& RGWPeriod::get_latest_epoch_oid()
 {
   if (cct->_conf->rgw_period_latest_epoch_info_oid.empty()) {
@@ -946,7 +943,8 @@ const string RGWPeriod::get_period_oid()
   return oss.str();
 }
 
-int RGWPeriod::read_latest_epoch(RGWPeriodLatestEpochInfo& info)
+int RGWPeriod::read_latest_epoch(RGWPeriodLatestEpochInfo& info,
+                                 RGWObjVersionTracker *objv)
 {
   string pool_name = get_pool_name(cct);
   string oid = get_period_oid_prefix() + get_latest_epoch_oid();
@@ -954,7 +952,7 @@ int RGWPeriod::read_latest_epoch(RGWPeriodLatestEpochInfo& info)
   rgw_bucket pool(pool_name.c_str());
   bufferlist bl;
   RGWObjectCtx obj_ctx(store);
-  int ret = rgw_get_system_obj(store, obj_ctx, pool, oid, bl, NULL, NULL);
+  int ret = rgw_get_system_obj(store, obj_ctx, pool, oid, bl, objv, nullptr);
   if (ret < 0) {
     ldout(cct, 1) << "error read_lastest_epoch " << pool << ":" << oid << dendl;
     return ret;
@@ -997,7 +995,8 @@ int RGWPeriod::use_latest_epoch()
   return 0;
 }
 
-int RGWPeriod::set_latest_epoch(epoch_t epoch, bool exclusive)
+int RGWPeriod::set_latest_epoch(epoch_t epoch, bool exclusive,
+                                RGWObjVersionTracker *objv)
 {
   string pool_name = get_pool_name(cct);
   string oid = get_period_oid_prefix() + get_latest_epoch_oid();
@@ -1011,7 +1010,52 @@ int RGWPeriod::set_latest_epoch(epoch_t epoch, bool exclusive)
   ::encode(info, bl);
 
   return rgw_put_system_obj(store, pool, oid, bl.c_str(), bl.length(),
-                            exclusive, NULL, real_time(), NULL);
+                            exclusive, objv, real_time(), nullptr);
+}
+
+int RGWPeriod::update_latest_epoch(epoch_t epoch)
+{
+  static constexpr int MAX_RETRIES = 20;
+
+  for (int i = 0; i < MAX_RETRIES; i++) {
+    RGWPeriodLatestEpochInfo info;
+    RGWObjVersionTracker objv;
+    bool exclusive = false;
+
+    // read existing epoch
+    int r = read_latest_epoch(info, &objv);
+    if (r == -ENOENT) {
+      // use an exclusive create to set the epoch atomically
+      exclusive = true;
+      ldout(cct, 20) << "creating initial latest_epoch=" << epoch
+          << " for period=" << id << dendl;
+    } else if (r < 0) {
+      ldout(cct, 0) << "ERROR: failed to read latest_epoch" << dendl;
+      return r;
+    } else if (epoch <= info.epoch) {
+      r = -EEXIST; // fail with EEXIST if epoch is not newer
+      ldout(cct, 1) << "found existing latest_epoch " << info.epoch
+          << " >= given epoch " << epoch << ", returning r=" << r << dendl;
+      return r;
+    } else {
+      ldout(cct, 20) << "updating latest_epoch from " << info.epoch
+          << " -> " << epoch << " on period=" << id << dendl;
+    }
+
+    r = set_latest_epoch(epoch, exclusive, &objv);
+    if (r == -EEXIST) {
+      continue; // exclusive create raced with another update, retry
+    } else if (r == -ECANCELED) {
+      continue; // write raced with a conflicting version, retry
+    }
+    if (r < 0) {
+      ldout(cct, 0) << "ERROR: failed to write latest_epoch" << dendl;
+      return r;
+    }
+    return 0; // return success
+  }
+
+  return -ECANCELED; // fail after max retries
 }
 
 int RGWPeriod::delete_obj()
@@ -1082,6 +1126,7 @@ int RGWPeriod::create(bool exclusive)
   ret = store_info(exclusive);
   if (ret < 0) {
     ldout(cct, 0) << "ERROR:  storing info for " << id << ": " << cpp_strerror(-ret) << dendl;
+    return ret;
   }
 
   ret = set_latest_epoch(epoch);
@@ -1094,12 +1139,6 @@ int RGWPeriod::create(bool exclusive)
 
 int RGWPeriod::store_info(bool exclusive)
 {
-  epoch_t latest_epoch = FIRST_EPOCH - 1;
-  int ret = get_latest_epoch(latest_epoch);
-  if (ret < 0 && ret != -ENOENT) {
-    ldout(cct, 0) << "ERROR: RGWPeriod::get_latest_epoch() returned " << cpp_strerror(-ret) << dendl;
-    return ret;
-  }
   string pool_name = get_pool_name(cct);
 
   rgw_bucket pool(pool_name.c_str());
@@ -1107,19 +1146,9 @@ int RGWPeriod::store_info(bool exclusive)
   string oid = get_period_oid();
   bufferlist bl;
   ::encode(*this, bl);
-  ret = rgw_put_system_obj(store, pool, oid, bl.c_str(), bl.length(), exclusive, NULL, real_time(), NULL);
-  if (ret < 0) {
-    ldout(cct, 0) << "ERROR: rgw_put_system_obj(" << pool << ":" << oid << "): " << cpp_strerror(-ret) << dendl;
-    return ret;
-  }
-  if (latest_epoch < epoch) {
-    ret = set_latest_epoch(epoch);
-    if (ret < 0) {
-      ldout(cct, 0) << "ERROR: RGWPeriod::set_latest_epoch() returned " << cpp_strerror(-ret) << dendl;
-      return ret;
-    }
-  }
-  return 0;
+
+  return rgw_put_system_obj(store, pool, oid, bl.c_str(), bl.length(),
+                            exclusive, NULL, real_time(), NULL);
 }
 
 const string& RGWPeriod::get_pool_name(CephContext *cct)
@@ -1128,28 +1157,6 @@ const string& RGWPeriod::get_pool_name(CephContext *cct)
     return RGW_DEFAULT_PERIOD_ROOT_POOL;
   }
   return cct->_conf->rgw_period_root_pool;
-}
-
-int RGWPeriod::use_next_epoch()
-{
-  epoch_t latest_epoch;
-  int ret = get_latest_epoch(latest_epoch);
-  if (ret < 0) {
-    return ret;
-  }
-  epoch = latest_epoch + 1;
-  ret = read_info();
-  if (ret < 0 && ret != -ENOENT) {
-    return ret;
-  }
-  if (ret == -ENOENT) {
-    ret = create();
-    if (ret < 0) {
-      ldout(cct, 0) << "Error creating new epoch " << epoch << dendl;
-      return ret;
-    }
-  }
-  return 0;
 }
 
 int RGWPeriod::add_zonegroup(const RGWZoneGroup& zonegroup)
@@ -1257,33 +1264,62 @@ void RGWPeriod::update(const RGWZoneGroupMap& map)
   period_map.master_zonegroup = map.master_zonegroup;
 }
 
-int RGWPeriod::update_sync_status()
+static int read_sync_status(RGWRados *store, rgw_meta_sync_status *sync_status)
 {
-  // must be new period's master zone to write sync status
-  if (master_zone != store->get_zone_params().get_id()) {
-    ldout(cct, 0) << "my zone " << store->get_zone_params().get_id()
-        << " is not period's master zone " << master_zone << dendl;
-    return -EINVAL;
+  // initialize a sync status manager to read the status
+  RGWMetaSyncStatusManager mgr(store, store->get_async_rados());
+  int r = mgr.init();
+  if (r < 0) {
+    return r;
+  }
+  r = mgr.read_sync_status(sync_status);
+  mgr.stop();
+  return r;
+}
+
+int RGWPeriod::update_sync_status(const RGWPeriod &current_period,
+                                  std::ostream& error_stream,
+                                  bool force_if_stale)
+{
+  rgw_meta_sync_status status;
+  int r = read_sync_status(store, &status);
+  if (r < 0) {
+    ldout(cct, 0) << "period failed to read sync status: "
+        << cpp_strerror(-r) << dendl;
+    return r;
   }
 
-  auto mdlog = store->meta_mgr->get_log(get_id());
-  const auto num_shards = cct->_conf->rgw_md_log_max_shards;
-
   std::vector<std::string> markers;
-  markers.reserve(num_shards);
 
-  // gather the markers for each shard
-  // TODO: use coroutines to read them in parallel
-  for (int i = 0; i < num_shards; i++) {
-    RGWMetadataLogInfo info;
-    int r = mdlog->get_info(i, &info);
-    if (r < 0) {
-      ldout(cct, 0) << "period failed to get metadata log info for shard " << i
-          << ": " << cpp_strerror(-r) << dendl;
-      return r;
+  const auto current_epoch = current_period.get_realm_epoch();
+  if (current_epoch != status.sync_info.realm_epoch) {
+    // no sync status markers for the current period
+    assert(current_epoch > status.sync_info.realm_epoch);
+    const int behind = current_epoch - status.sync_info.realm_epoch;
+    if (!force_if_stale && current_epoch > 1) {
+      error_stream << "ERROR: This zone is " << behind << " period(s) behind "
+          "the current master zone in metadata sync. If this zone is promoted "
+          "to master, any metadata changes during that time are likely to "
+          "be lost.\n"
+          "Waiting for this zone to catch up on metadata sync (see "
+          "'radosgw-admin sync status') is recommended.\n"
+          "To promote this zone to master anyway, add the flag "
+          "--yes-i-really-mean-it." << std::endl;
+      return -EINVAL;
     }
-    ldout(cct, 15) << "got shard " << i << " marker " << info.marker << dendl;
-    markers.emplace_back(std::move(info.marker));
+    // empty sync status markers - other zones will skip this period during
+    // incremental metadata sync
+    markers.resize(status.sync_info.num_shards);
+  } else {
+    markers.reserve(status.sync_info.num_shards);
+    for (auto& i : status.sync_markers) {
+      auto& marker = i.second;
+      // filter out markers from other periods
+      if (marker.realm_epoch != current_epoch) {
+        marker.marker.clear();
+      }
+      markers.emplace_back(std::move(marker.marker));
+    }
   }
 
   std::swap(sync_status, markers);
@@ -1291,7 +1327,7 @@ int RGWPeriod::update_sync_status()
 }
 
 int RGWPeriod::commit(RGWRealm& realm, const RGWPeriod& current_period,
-                      std::ostream& error_stream)
+                      std::ostream& error_stream, bool force_if_stale)
 {
   ldout(cct, 20) << __func__ << " realm " << realm.get_id() << " period " << current_period.get_id() << dendl;
   // gateway must be in the master zone to commit
@@ -1321,7 +1357,7 @@ int RGWPeriod::commit(RGWRealm& realm, const RGWPeriod& current_period,
   // did the master zone change?
   if (master_zone != current_period.get_master_zone()) {
     // store the current metadata sync status in the period
-    int r = update_sync_status();
+    int r = update_sync_status(current_period, error_stream, force_if_stale);
     if (r < 0) {
       ldout(cct, 0) << "failed to update metadata sync status: "
           << cpp_strerror(-r) << dendl;
@@ -1365,7 +1401,11 @@ int RGWPeriod::commit(RGWRealm& realm, const RGWPeriod& current_period,
     return r;
   }
   // set as latest epoch
-  r = set_latest_epoch(epoch);
+  r = update_latest_epoch(epoch);
+  if (r == -EEXIST) {
+    // already have this epoch (or a more recent one)
+    return 0;
+  }
   if (r < 0) {
     ldout(cct, 0) << "failed to set latest epoch: " << cpp_strerror(-r) << dendl;
     return r;
@@ -2144,9 +2184,9 @@ void RGWObjVersionTracker::generate_new_write_ver(CephContext *cct)
 
 int RGWPutObjProcessor::complete(string& etag, real_time *mtime, real_time set_mtime,
                                  map<string, bufferlist>& attrs, real_time delete_at,
-                                 const char *if_match, const char * if_nomatch)
+                                 const char *if_match, const char *if_nomatch, const string *user_data)
 {
-  int r = do_complete(etag, mtime, set_mtime, attrs, delete_at, if_match, if_nomatch);
+  int r = do_complete(etag, mtime, set_mtime, attrs, delete_at, if_match, if_nomatch, user_data);
   if (r < 0)
     return r;
 
@@ -2308,6 +2348,11 @@ int RGWPutObjProcessor_Atomic::write_data(bufferlist& bl, off_t ofs, void **phan
 
   *pobj = cur_obj;
 
+  if (!bl.length()) {
+    *phandle = nullptr;
+    return 0;
+  }
+
   return RGWPutObjProcessor_Aio::handle_obj_data(cur_obj, bl, ofs - cur_part_ofs, ofs, phandle, exclusive);
 }
 
@@ -2447,7 +2492,7 @@ int RGWPutObjProcessor_Atomic::complete_writing_data()
     obj_len = (uint64_t)first_chunk.length();
   }
   while (pending_data_bl.length()) {
-    void *handle;
+    void *handle = nullptr;
     rgw_obj obj;
     uint64_t max_write_size = MIN(max_chunk_size, (uint64_t)next_part_ofs - data_ofs);
     if (max_write_size > pending_data_bl.length()) {
@@ -2490,7 +2535,7 @@ int RGWPutObjProcessor_Atomic::complete_writing_data()
 int RGWPutObjProcessor_Atomic::do_complete(string& etag, real_time *mtime, real_time set_mtime,
                                            map<string, bufferlist>& attrs, real_time delete_at,
                                            const char *if_match,
-                                           const char *if_nomatch) {
+                                           const char *if_nomatch, const string *user_data) {
   int r = complete_writing_data();
   if (r < 0)
     return r;
@@ -2515,6 +2560,7 @@ int RGWPutObjProcessor_Atomic::do_complete(string& etag, real_time *mtime, real_
   obj_op.meta.flags = PUT_OBJ_CREATE;
   obj_op.meta.olh_epoch = olh_epoch;
   obj_op.meta.delete_at = delete_at;
+  obj_op.meta.user_data = user_data;
 
   r = obj_op.write_meta(obj_len, attrs);
   if (r < 0) {
@@ -3078,7 +3124,7 @@ int RGWRados::get_required_alignment(rgw_bucket& bucket, uint64_t *alignment)
 
 int RGWRados::get_max_chunk_size(rgw_bucket& bucket, uint64_t *max_chunk_size)
 {
-  uint64_t alignment;
+  uint64_t alignment = 0;
   int r = get_required_alignment(bucket, &alignment);
   if (r < 0) {
     return r;
@@ -5175,6 +5221,7 @@ int RGWRados::create_bucket(RGWUserInfo& owner, rgw_bucket& bucket,
                             obj_version *pep_objv,
                             real_time creation_time,
                             rgw_bucket *pmaster_bucket,
+                            uint32_t *pmaster_num_shards,
 			    bool exclusive)
 {
 #define MAX_CREATE_RETRIES 20 /* need to bound retries */
@@ -5207,8 +5254,13 @@ int RGWRados::create_bucket(RGWUserInfo& owner, rgw_bucket& bucket,
       bucket.marker = pmaster_bucket->marker;
       bucket.bucket_id = pmaster_bucket->bucket_id;
     }
+    if (pmaster_num_shards) {
+      info.num_shards = *pmaster_num_shards;
+    } else {
+      info.num_shards = bucket_index_max_shards;
+    }
 
-    r = init_bucket_index(bucket, bucket_index_max_shards);
+    r = init_bucket_index(bucket, info.num_shards);
     if (r < 0)
       return r;
 
@@ -5227,7 +5279,6 @@ int RGWRados::create_bucket(RGWUserInfo& owner, rgw_bucket& bucket,
     info.index_type = rule_info.index_type;
     info.swift_ver_location = swift_ver_location;
     info.swift_versioning = (!swift_ver_location.empty());
-    info.num_shards = bucket_index_max_shards;
     info.bucket_index_shard_hash_type = RGWBucketInfo::MOD;
     info.requester_pays = false;
     if (real_clock::is_zero(creation_time))
@@ -6241,9 +6292,16 @@ int RGWRados::Object::Write::write_meta(uint64_t size,
   string index_tag;
   uint64_t epoch;
   int64_t poolid;
-
-  bool orig_exists = state->exists;
-  uint64_t orig_size = state->size;
+  bool orig_exists;
+  uint64_t orig_size;
+  
+  if (!reset_obj) {    //Multipart upload, it has immutable head. 
+    orig_exists = false;
+    orig_size = 0;
+  } else {
+    orig_exists = state->exists;
+    orig_size = state->size;
+  }
 
   bool versioned_target = (meta.olh_epoch > 0 || !obj.get_instance().empty());
 
@@ -6282,7 +6340,7 @@ int RGWRados::Object::Write::write_meta(uint64_t size,
 
   r = index_op.complete(poolid, epoch, size,
                         meta.set_mtime, etag, content_type, &acl_bl,
-                        meta.category, meta.remove_objs);
+                        meta.category, meta.remove_objs, meta.user_data);
   if (r < 0)
     goto done_cancel;
 
@@ -7381,7 +7439,7 @@ bool RGWRados::is_syncing_bucket_meta(rgw_bucket& bucket)
   }
 
   /* single zonegroup and a single zone */
-  if (current_period.is_single_zonegroup(cct, this) && get_zonegroup().zones.size() == 1) {
+  if (current_period.is_single_zonegroup() && get_zonegroup().zones.size() == 1) {
     return false;
   }
 
@@ -7392,20 +7450,9 @@ bool RGWRados::is_syncing_bucket_meta(rgw_bucket& bucket)
 
   return true;
 }
-  
-/**
- * Delete a bucket.
- * bucket: the name of the bucket to delete
- * Returns 0 on success, -ERR# otherwise.
- */
-int RGWRados::delete_bucket(rgw_bucket& bucket, RGWObjVersionTracker& objv_tracker)
-{
-  librados::IoCtx index_ctx;
-  map<int, string> bucket_objs;
-  int r = open_bucket_index(bucket, index_ctx, bucket_objs);
-  if (r < 0)
-    return r;
 
+int RGWRados::check_bucket_empty(rgw_bucket& bucket)
+{
   std::map<string, RGWObjEnt> ent_map;
   rgw_obj_key marker;
   string prefix;
@@ -7413,7 +7460,7 @@ int RGWRados::delete_bucket(rgw_bucket& bucket, RGWObjVersionTracker& objv_track
 
   do {
 #define NUM_ENTRIES 1000
-    r = cls_bucket_list(bucket, RGW_NO_SHARD, marker, prefix, NUM_ENTRIES, true, ent_map,
+    int r = cls_bucket_list(bucket, RGW_NO_SHARD, marker, prefix, NUM_ENTRIES, true, ent_map,
                         &is_truncated, &marker);
     if (r < 0)
       return r;
@@ -7429,7 +7476,29 @@ int RGWRados::delete_bucket(rgw_bucket& bucket, RGWObjVersionTracker& objv_track
         return -ENOTEMPTY;
     }
   } while (is_truncated);
+  return 0;
+}
 
+/**
+ * Delete a bucket.
+ * bucket: the name of the bucket to delete
+ * Returns 0 on success, -ERR# otherwise.
+ */
+int RGWRados::delete_bucket(rgw_bucket& bucket, RGWObjVersionTracker& objv_tracker, bool check_empty)
+{
+  librados::IoCtx index_ctx;
+  map<int, string> bucket_objs;
+  int r = open_bucket_index(bucket, index_ctx, bucket_objs);
+  if (r < 0)
+    return r;
+
+  if (check_empty) {
+    r = check_bucket_empty(bucket);
+    if (r < 0) {
+      return r;
+    }
+  }
+  
   r = rgw_bucket_delete_bucket_obj(this, bucket.tenant, bucket.name, objv_tracker);
   if (r < 0)
     return r;
@@ -7450,7 +7519,6 @@ int RGWRados::delete_bucket(rgw_bucket& bucket, RGWObjVersionTracker& objv_track
   }
   return 0;
 }
-
 
 int RGWRados::set_bucket_owner(rgw_bucket& bucket, ACLOwner& owner)
 {
@@ -7913,6 +7981,8 @@ int RGWRados::Object::Delete::delete_obj()
       if (params.expiration_time != delete_at) {
         return -ERR_PRECONDITION_FAILED;
       }
+    } else {
+      return -ERR_PRECONDITION_FAILED;
     }
   }
 
@@ -8976,7 +9046,7 @@ int RGWRados::Bucket::UpdateIndex::prepare(RGWModifyOp op)
 
 int RGWRados::Bucket::UpdateIndex::complete(int64_t poolid, uint64_t epoch, uint64_t size,
                                     ceph::real_time& ut, string& etag, string& content_type, bufferlist *acl_bl, RGWObjCategory category,
-                                    list<rgw_obj_key> *remove_objs)
+                                    list<rgw_obj_key> *remove_objs, const string *user_data)
 {
   if (blind) {
     return 0;
@@ -8994,6 +9064,9 @@ int RGWRados::Bucket::UpdateIndex::complete(int64_t poolid, uint64_t epoch, uint
   ent.size = size;
   ent.mtime = ut;
   ent.etag = etag;
+  if (user_data)
+    ent.user_data = *user_data;
+
   ACLOwner owner;
   if (acl_bl && acl_bl->length()) {
     int ret = store->decode_policy(*acl_bl, &owner);
@@ -10614,16 +10687,16 @@ int RGWRados::get_bucket_stats_async(rgw_bucket& bucket, int shard_id, RGWGetBuc
     return r;
 
   int num_aio = 0;
-  RGWGetBucketStatsContext *get_ctx = new RGWGetBucketStatsContext(ctx, binfo.num_shards);
+  RGWGetBucketStatsContext *get_ctx = new RGWGetBucketStatsContext(ctx, binfo.num_shards ? : 1);
   assert(get_ctx);
   r = cls_bucket_head_async(bucket, shard_id, get_ctx, &num_aio);
-  get_ctx->put();
   if (r < 0) {
     ctx->put();
     if (num_aio) {
       get_ctx->unset_cb();
     }
   }
+  get_ctx->put();
   return r;
 }
 
@@ -11535,6 +11608,7 @@ int RGWRados::cls_obj_complete_op(BucketShard& bs, RGWModifyOp op, string& tag,
   dir_meta.owner_display_name = ent.owner_display_name;
   dir_meta.content_type = ent.content_type;
   dir_meta.category = category;
+  dir_meta.user_data = ent.user_data;
 
   rgw_bucket_entry_ver ver;
   ver.pool = pool;
@@ -11654,6 +11728,7 @@ int RGWRados::cls_bucket_list(rgw_bucket& bucket, int shard_id, rgw_obj_key& sta
     e.tag = dirent.tag;
     e.flags = dirent.flags;
     e.versioned_epoch = dirent.versioned_epoch;
+    e.user_data = dirent.meta.user_data;
 
     bool force_check = force_check_filter && force_check_filter(dirent.key.name);
     if ((!dirent.exists && !dirent.is_delete_marker()) || !dirent.pending_map.empty() || force_check) {

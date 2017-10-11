@@ -1436,7 +1436,8 @@ class RGWPeriod
   RGWRados *store;
 
   int read_info();
-  int read_latest_epoch(RGWPeriodLatestEpochInfo& epoch_info);
+  int read_latest_epoch(RGWPeriodLatestEpochInfo& epoch_info,
+                        RGWObjVersionTracker *objv = nullptr);
   int use_latest_epoch();
   int use_current_period();
 
@@ -1444,7 +1445,8 @@ class RGWPeriod
   const string get_period_oid_prefix();
 
   // gather the metadata sync status for each shard; only for use on master zone
-  int update_sync_status();
+  int update_sync_status(const RGWPeriod &current_period,
+                         std::ostream& error_stream, bool force_if_stale);
 
 public:
   RGWPeriod() : epoch(0) {}
@@ -1496,15 +1498,36 @@ public:
   int get_zonegroup(RGWZoneGroup& zonegroup,
 		    const string& zonegroup_id);
 
-  bool is_single_zonegroup(CephContext *cct, RGWRados *store);
+  bool is_single_zonegroup()
+  {
+      return (period_map.zonegroups.size() == 1);
+  }
+
+  /*
+    returns true if there are several zone groups with a least one zone
+   */
+  bool is_multi_zonegroups_with_zones()
+  {
+    int count = 0;
+    for (const auto& zg:  period_map.zonegroups) {
+      if (zg.second.zones.size() > 0) {
+	if (count++ > 0) {
+	  return true;
+	}
+      }
+    }
+    return false;
+  }
 
   int get_latest_epoch(epoch_t& epoch);
-  int set_latest_epoch(epoch_t epoch, bool exclusive = false);
+  int set_latest_epoch(epoch_t epoch, bool exclusive = false,
+                       RGWObjVersionTracker *objv = nullptr);
+  // update latest_epoch if the given epoch is higher, else return -EEXIST
+  int update_latest_epoch(epoch_t epoch);
 
   int init(CephContext *_cct, RGWRados *_store, const string &period_realm_id, const string &period_realm_name = "",
 	   bool setup_obj = true);
   int init(CephContext *_cct, RGWRados *_store, bool setup_obj = true);  
-  int use_next_epoch();
 
   int create(bool exclusive = true);
   int delete_obj();
@@ -1516,7 +1539,7 @@ public:
 
   // commit a staging period; only for use on master zone
   int commit(RGWRealm& realm, const RGWPeriod &current_period,
-             std::ostream& error_stream);
+             std::ostream& error_stream, bool force_if_stale = false);
 
   void encode(bufferlist& bl) const {
     ENCODE_START(1, 1, bl);
@@ -1766,6 +1789,7 @@ class RGWRados
   friend class RGWDataSyncProcessorThread;
   friend class RGWStateLog;
   friend class RGWReplicaLogger;
+  friend class RGWCompleteMultipart;
 
   /** Open the pool used as root for this gateway */
   int open_root_pool_ctx();
@@ -2117,6 +2141,7 @@ public:
                             obj_version *pep_objv,
                             ceph::real_time creation_time,
                             rgw_bucket *master_bucket,
+                            uint32_t *master_num_shards,
                             bool exclusive = true);
   virtual int add_bucket_placement(std::string& new_pool);
   virtual int remove_bucket_placement(std::string& new_pool);
@@ -2306,10 +2331,11 @@ public:
         uint64_t olh_epoch;
         ceph::real_time delete_at;
         bool canceled;
+        const string *user_data;
 
         MetaParams() : mtime(NULL), rmattrs(NULL), data(NULL), manifest(NULL), ptag(NULL),
                  remove_objs(NULL), category(RGW_OBJ_CATEGORY_MAIN), flags(0),
-                 if_match(NULL), if_nomatch(NULL), olh_epoch(0), canceled(false) {}
+                 if_match(NULL), if_nomatch(NULL), olh_epoch(0), canceled(false), user_data(nullptr) {}
       } meta;
 
       explicit Write(RGWRados::Object *_target) : target(_target) {}
@@ -2436,7 +2462,7 @@ public:
       int complete(int64_t poolid, uint64_t epoch, uint64_t size,
                    ceph::real_time& ut, string& etag, string& content_type,
                    bufferlist *acl_bl, RGWObjCategory category,
-		   list<rgw_obj_key> *remove_objs);
+		   list<rgw_obj_key> *remove_objs, const string *user_data = nullptr);
       int complete_del(int64_t poolid, uint64_t epoch,
                        ceph::real_time& removed_mtime, /* mtime of removed object */
                        list<rgw_obj_key> *remove_objs);
@@ -2623,12 +2649,14 @@ public:
                string *petag,
                struct rgw_err *err);
 
+  int check_bucket_empty(rgw_bucket& bucket);
+
   /**
    * Delete a bucket.
    * bucket: the name of the bucket to delete
    * Returns 0 on success, -ERR# otherwise.
    */
-  virtual int delete_bucket(rgw_bucket& bucket, RGWObjVersionTracker& objv_tracker);
+  virtual int delete_bucket(rgw_bucket& bucket, RGWObjVersionTracker& objv_tracker, bool check_empty = true);
 
   bool is_meta_master();
 
@@ -3003,7 +3031,8 @@ public:
   }
 
   bool need_to_log_metadata() {
-    return get_zone().log_meta;
+    return is_meta_master() &&
+      (get_zonegroup().zones.size() > 1 || current_period.is_multi_zonegroups_with_zones());
   }
 
   librados::Rados* get_rados_handle();
@@ -3158,7 +3187,7 @@ protected:
 
   virtual int do_complete(string& etag, ceph::real_time *mtime, ceph::real_time set_mtime,
                           map<string, bufferlist>& attrs, ceph::real_time delete_at,
-                          const char *if_match = NULL, const char *if_nomatch = NULL) = 0;
+                          const char *if_match = NULL, const char *if_nomatch = NULL, const string *user_data = nullptr) = 0;
 
 public:
   RGWPutObjProcessor(RGWObjectCtx& _obj_ctx, RGWBucketInfo& _bi) : store(NULL), obj_ctx(_obj_ctx), is_complete(false), bucket_info(_bi), canceled(false) {}
@@ -3174,7 +3203,7 @@ public:
   }
   virtual int complete(string& etag, ceph::real_time *mtime, ceph::real_time set_mtime,
                        map<string, bufferlist>& attrs, ceph::real_time delete_at,
-                       const char *if_match = NULL, const char *if_nomatch = NULL);
+                       const char *if_match = NULL, const char *if_nomatch = NULL, const string *user_data = nullptr);
 
   CephContext *ctx();
 
@@ -3248,7 +3277,7 @@ protected:
   int write_data(bufferlist& bl, off_t ofs, void **phandle, rgw_obj *pobj, bool exclusive);
   virtual int do_complete(string& etag, ceph::real_time *mtime, ceph::real_time set_mtime,
                           map<string, bufferlist>& attrs, ceph::real_time delete_at,
-                          const char *if_match = NULL, const char *if_nomatch = NULL);
+                          const char *if_match = NULL, const char *if_nomatch = NULL, const string *user_data = NULL);
 
   int prepare_next_part(off_t ofs);
   int complete_parts();

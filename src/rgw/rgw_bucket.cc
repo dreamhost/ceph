@@ -1885,6 +1885,8 @@ int RGWDataChangesLog::list_entries(int shard, const real_time& start_time, cons
 				    const string& marker,
 				    string *out_marker,
 				    bool *truncated) {
+  if (shard >= num_shards)
+    return -EINVAL;
 
   list<cls_log_entry> log_entries;
 
@@ -1968,7 +1970,7 @@ int RGWDataChangesLog::trim_entries(int shard_id, const real_time& start_time, c
 
   ret = store->time_log_trim(oids[shard_id], start_time, end_time, start_marker, end_marker);
 
-  if (ret == -ENOENT)
+  if (ret == -ENOENT || ret == -ENODATA)
     ret = 0;
 
   return ret;
@@ -1979,7 +1981,7 @@ int RGWDataChangesLog::trim_entries(const real_time& start_time, const real_time
 {
   for (int shard = 0; shard < num_shards; shard++) {
     int ret = store->time_log_trim(oids[shard], start_time, end_time, start_marker, end_marker);
-    if (ret == -ENOENT) {
+    if (ret == -ENOENT || ret == -ENODATA) {
       continue;
     }
     if (ret < 0)

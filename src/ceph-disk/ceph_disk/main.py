@@ -39,6 +39,7 @@ import shlex
 import pwd
 import grp
 import textwrap
+import glob
 
 CEPH_OSD_ONDISK_MAGIC = 'ceph osd volume v026'
 CEPH_LOCKBOX_ONDISK_MAGIC = 'ceph lockbox volume v001'
@@ -427,8 +428,62 @@ def command(arguments, **kwargs):
     return _bytes2str(out), _bytes2str(err), process.returncode
 
 
+def command_with_stdin(arguments, stdin):
+    LOG.info("Running command with stdin: " + " ".join(arguments))
+    process = subprocess.Popen(
+        arguments,
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE)
+    out, err = process.communicate(stdin)
+    LOG.debug(out)
+    if process.returncode != 0:
+        LOG.error(err)
+        raise SystemExit(
+            "'{cmd}' failed with status code {returncode}".format(
+                cmd=arguments,
+                returncode=process.returncode,
+            )
+        )
+    return out
+
+
 def _bytes2str(string):
     return string.decode('utf-8') if isinstance(string, bytes) else string
+
+
+def command_init(arguments, **kwargs):
+    """
+    Safely execute a non-blocking ``subprocess.Popen`` call
+    making sure that the executable exists and raising a helpful
+    error message if it does not.
+
+    .. note:: This should be the preferred way of calling ``subprocess.Popen``
+    since it provides the caller with the safety net of making sure that
+    executables *will* be found and will error nicely otherwise.
+
+    This returns the process.
+    """
+
+    arguments = list(map(_bytes2str, _get_command_executable(arguments)))
+
+    LOG.info('Running command: %s' % ' '.join(arguments))
+    process = subprocess.Popen(
+        arguments,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        **kwargs)
+    return process
+
+
+def command_wait(process):
+    """
+    Wait for the process finish and parse its output.
+    """
+
+    out, err = process.communicate()
+
+    return _bytes2str(out), _bytes2str(err), process.returncode
 
 
 def command_check_call(arguments):
@@ -734,20 +789,6 @@ def get_partition_base_mpath(dev):
     return os.path.join('/dev/mapper', name)
 
 
-def is_bcache(dev_name):
-    """
-    Check if dev_name is a bcache
-    """
-    if not dev_name.startswith('bcache'):
-        return False
-    if not os.path.exists(os.path.join('/sys/block', dev_name, 'bcache')):
-        return False
-    if os.path.exists(os.path.join('/sys/block', dev_name,
-                                   'bcache/cache_mode')):
-        return True
-    return False
-
-
 def is_partition(dev):
     """
     Check whether a given device path is a partition or a full disk.
@@ -761,8 +802,6 @@ def is_partition(dev):
         raise Error('not a block device', dev)
 
     name = get_dev_name(dev)
-    if is_bcache(name):
-        return True
     if os.path.exists(os.path.join('/sys/block', name)):
         return False
 
@@ -1152,11 +1191,14 @@ def get_dmcrypt_key(
         osd_uuid = get_oneliner(path, 'osd-uuid')
         ceph_fsid = read_one_line(path, 'ceph_fsid')
         if ceph_fsid is None:
-            raise Error('No cluster uuid assigned.')
-        cluster = find_cluster_by_uuid(ceph_fsid)
-        if cluster is None:
-            raise Error('No cluster conf found in ' + SYSCONFDIR +
-                        ' with fsid %s' % ceph_fsid)
+            LOG.warning("no `ceph_fsid` found falling back to 'ceph' "
+                        "for cluster name")
+            cluster = 'ceph'
+        else:
+            cluster = find_cluster_by_uuid(ceph_fsid)
+            if cluster is None:
+                raise Error('No cluster conf found in ' + SYSCONFDIR +
+                            ' with fsid %s' % ceph_fsid)
 
         if mode == KEY_MANAGEMENT_MODE_V1:
             key, stderr, ret = command(
@@ -1413,6 +1455,7 @@ def check_journal_reqs(args):
     _, _, allows_journal = command([
         'ceph-osd', '--check-allows-journal',
         '-i', '0',
+        '--log-file', '$run_dir/$cluster-osd-check.log',
         '--cluster', args.cluster,
         '--setuser', get_ceph_user(),
         '--setgroup', get_ceph_group(),
@@ -1420,6 +1463,7 @@ def check_journal_reqs(args):
     _, _, wants_journal = command([
         'ceph-osd', '--check-wants-journal',
         '-i', '0',
+        '--log-file', '$run_dir/$cluster-osd-check.log',
         '--cluster', args.cluster,
         '--setuser', get_ceph_user(),
         '--setgroup', get_ceph_group(),
@@ -1427,6 +1471,7 @@ def check_journal_reqs(args):
     _, _, needs_journal = command([
         'ceph-osd', '--check-needs-journal',
         '-i', '0',
+        '--log-file', '$run_dir/$cluster-osd-check.log',
         '--cluster', args.cluster,
         '--setuser', get_ceph_user(),
         '--setgroup', get_ceph_group(),
@@ -2342,17 +2387,18 @@ class Lockbox(object):
         cluster = self.args.cluster
         bootstrap = self.args.prepare_key_template.format(cluster=cluster,
                                                           statedir=STATEDIR)
-        command_check_call(
+        command_with_stdin(
             [
                 'ceph',
                 '--cluster', cluster,
                 '--name', 'client.bootstrap-osd',
                 '--keyring', bootstrap,
+                '-i', '-',
                 'config-key',
                 'put',
                 'dm-crypt/osd/' + self.args.osd_uuid + '/luks',
-                base64_key,
             ],
+            base64_key
         )
         keyring, stderr, ret = command(
             [
@@ -3789,6 +3835,10 @@ def main_activate_space(name, args):
     if not os.path.exists(args.dev):
         raise Error('%s does not exist' % args.dev)
 
+    if is_suppressed(args.dev):
+        LOG.info('suppressed activate request on space %s', args.dev)
+        return
+
     cluster = None
     osd_id = None
     osd_uuid = None
@@ -4484,6 +4534,193 @@ def main_trigger(args):
         LOG.debug(err)
 
 
+def main_fix(args):
+    # A hash table containing 'path': ('uid', 'gid', blocking, recursive)
+    fix_table = [
+        ('/usr/bin/ceph-mon', 'root', 'root', True, False),
+        ('/usr/bin/ceph-mds', 'root', 'root', True, False),
+        ('/usr/bin/ceph-osd', 'root', 'root', True, False),
+        ('/usr/bin/radosgw', 'root', 'root', True, False),
+        ('/etc/ceph', 'root', 'root', True, True),
+        ('/var/run/ceph', 'ceph', 'ceph', True, True),
+        ('/var/log/ceph', 'ceph', 'ceph', True, True),
+        ('/var/log/radosgw', 'ceph', 'ceph', True, True),
+        ('/var/lib/ceph', 'ceph', 'ceph', True, False),
+    ]
+
+    # Relabel/chown all files under /var/lib/ceph/ recursively (except for osd)
+    for directory in glob.glob('/var/lib/ceph/*'):
+        if directory == '/var/lib/ceph/osd':
+            fix_table.append((directory, 'ceph', 'ceph', True, False))
+        else:
+            fix_table.append((directory, 'ceph', 'ceph', True, True))
+
+    # Relabel/chown the osds recursively and in parallel
+    for directory in glob.glob('/var/lib/ceph/osd/*'):
+        fix_table.append((directory, 'ceph', 'ceph', False, True))
+
+    LOG.debug("fix_table: " + str(fix_table))
+
+    # The lists of background processes
+    all_processes = []
+    permissions_processes = []
+    selinux_processes = []
+
+    # Preliminary checks
+    if args.selinux or args.all:
+        out, err, ret = command(['selinuxenabled'])
+        if ret:
+            LOG.error('SELinux is not enabled, please enable it, first.')
+            raise Error('no SELinux')
+
+    for daemon in ['ceph-mon', 'ceph-osd', 'ceph-mds', 'radosgw', 'ceph-mgr']:
+        out, err, ret = command(['pgrep', daemon])
+        if ret == 0:
+            LOG.error(daemon + ' is running, please stop it, first')
+            raise Error(daemon + ' running')
+
+    # Relabel the basic system data without the ceph files
+    if args.system or args.all:
+        c = ['restorecon', '-R', '/']
+        for directory, _, _, _, _ in fix_table:
+            # Skip /var/lib/ceph subdirectories
+            if directory.startswith('/var/lib/ceph/'):
+                continue
+            c.append('-e')
+            c.append(directory)
+
+        out, err, ret = command(c)
+
+        if ret:
+            LOG.error("Failed to restore labels of the underlying system")
+            LOG.error(err)
+            raise Error("basic restore failed")
+
+    # Use find to relabel + chown ~simultaenously
+    if args.all:
+        for directory, uid, gid, blocking, recursive in fix_table:
+            # Skip directories/files that are not installed
+            if not os.access(directory, os.F_OK):
+                continue
+
+            c = [
+                'find',
+                directory,
+                '-exec',
+                'chown',
+                ':'.join((uid, gid)),
+                '{}',
+                '+',
+                '-exec',
+                'restorecon',
+                '{}',
+                '+',
+            ]
+
+            # Just pass -maxdepth 0 for non-recursive calls
+            if not recursive:
+                c += ['-maxdepth', '0']
+
+            if blocking:
+                out, err, ret = command(c)
+
+                if ret:
+                    LOG.error("Failed to fix " + directory)
+                    LOG.error(err)
+                    raise Error(directory + " fix failed")
+            else:
+                all_processes.append(command_init(c))
+
+    LOG.debug("all_processes: " + str(all_processes))
+    for process in all_processes:
+        out, err, ret = command_wait(process)
+        if ret:
+            LOG.error("A background find process failed")
+            LOG.error(err)
+            raise Error("background failed")
+
+    # Fix permissions
+    if args.permissions:
+        for directory, uid, gid, blocking, recursive in fix_table:
+            # Skip directories/files that are not installed
+            if not os.access(directory, os.F_OK):
+                continue
+
+            if recursive:
+                c = [
+                    'chown',
+                    '-R',
+                    ':'.join((uid, gid)),
+                    directory
+                ]
+            else:
+                c = [
+                    'chown',
+                    ':'.join((uid, gid)),
+                    directory
+                ]
+
+            if blocking:
+                out, err, ret = command(c)
+
+                if ret:
+                    LOG.error("Failed to chown " + directory)
+                    LOG.error(err)
+                    raise Error(directory + " chown failed")
+            else:
+                permissions_processes.append(command_init(c))
+
+    LOG.debug("permissions_processes: " + str(permissions_processes))
+    for process in permissions_processes:
+        out, err, ret = command_wait(process)
+        if ret:
+            LOG.error("A background permissions process failed")
+            LOG.error(err)
+            raise Error("background failed")
+
+    # Fix SELinux labels
+    if args.selinux:
+        for directory, uid, gid, blocking, recursive in fix_table:
+            # Skip directories/files that are not installed
+            if not os.access(directory, os.F_OK):
+                continue
+
+            if recursive:
+                c = [
+                    'restorecon',
+                    '-R',
+                    directory
+                ]
+            else:
+                c = [
+                    'restorecon',
+                    directory
+                ]
+
+            if blocking:
+                out, err, ret = command(c)
+
+                if ret:
+                    LOG.error("Failed to restore labels for " + directory)
+                    LOG.error(err)
+                    raise Error(directory + " relabel failed")
+            else:
+                selinux_processes.append(command_init(c))
+
+    LOG.debug("selinux_processes: " + str(selinux_processes))
+    for process in selinux_processes:
+        out, err, ret = command_wait(process)
+        if ret:
+            LOG.error("A background selinux process failed")
+            LOG.error(err)
+            raise Error("background failed")
+
+    LOG.info(
+        "The ceph files has been fixed, please reboot "
+        "the system for the changes to take effect."
+    )
+
+
 def setup_statedir(dir):
     # XXX The following use of globals makes linting
     # really hard. Global state in Python is iffy and
@@ -4581,9 +4818,48 @@ def parse_args(argv):
     make_destroy_parser(subparsers)
     make_zap_parser(subparsers)
     make_trigger_parser(subparsers)
+    make_fix_parser(subparsers)
 
     args = parser.parse_args(argv)
     return args
+
+
+def make_fix_parser(subparsers):
+    fix_parser = subparsers.add_parser(
+        'fix',
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        description=textwrap.fill(textwrap.dedent("""\
+        """)),
+        help='fix SELinux labels and/or file permissions')
+
+    fix_parser.add_argument(
+        '--system',
+        action='store_true',
+        default=False,
+        help='fix SELinux labels for the non-ceph system data'
+    )
+    fix_parser.add_argument(
+        '--selinux',
+        action='store_true',
+        default=False,
+        help='fix SELinux labels for ceph data'
+    )
+    fix_parser.add_argument(
+        '--permissions',
+        action='store_true',
+        default=False,
+        help='fix file permissions for ceph data'
+    )
+    fix_parser.add_argument(
+        '--all',
+        action='store_true',
+        default=False,
+        help='perform all the fix-related operations'
+    )
+    fix_parser.set_defaults(
+        func=main_fix,
+    )
+    return fix_parser
 
 
 def make_trigger_parser(subparsers):

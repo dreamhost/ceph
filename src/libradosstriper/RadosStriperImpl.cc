@@ -12,6 +12,8 @@
  *
  */
 
+#include <boost/algorithm/string/replace.hpp>
+
 #include "libradosstriper/RadosStriperImpl.h"
 
 #include <errno.h>
@@ -466,7 +468,9 @@ int libradosstriper::RadosStriperImpl::aio_read(const std::string& soid,
   // get list of extents to be read from
   vector<ObjectExtent> *extents = new vector<ObjectExtent>();
   if (read_len > 0) {
-    std::string format = soid + RADOS_OBJECT_EXTENSION_FORMAT;
+    std::string format = soid;
+    boost::replace_all(format, "%", "%%");
+    format += RADOS_OBJECT_EXTENSION_FORMAT;
     file_layout_t l;
     l.from_legacy(layout);
     Striper::file_to_extents(cct(), format.c_str(), &l, off, read_len,
@@ -600,6 +604,11 @@ int libradosstriper::RadosStriperImpl::remove(const std::string& soid, int flags
       uint64_t remaining_objects = std::min(remaining_stripe_units, stripe_count);
       nb_objects = nb_complete_sets * stripe_count + remaining_objects;
     }
+
+    // We cannot have 0 objects, at least one is present
+    if (nb_objects == 0)
+        nb_objects++;
+
     // delete rados objects in reverse order
     int rcr = 0;
     for (int i = nb_objects-1; i >= 0; i--) {
@@ -776,7 +785,9 @@ libradosstriper::RadosStriperImpl::internal_aio_write(const std::string& soid,
   if (len > 0) {
     // get list of extents to be written to
     vector<ObjectExtent> extents;
-    std::string format = soid + RADOS_OBJECT_EXTENSION_FORMAT;
+    std::string format = soid;
+    boost::replace_all(format, "%", "%%");
+    format += RADOS_OBJECT_EXTENSION_FORMAT;
     file_layout_t l;
     l.from_legacy(layout);
     Striper::file_to_extents(cct(), format.c_str(), &l, off, len, 0, extents);

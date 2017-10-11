@@ -2445,6 +2445,12 @@ int RGWPutCORS_ObjStore_S3::get_params()
     goto done_err;
   }
 
+  // forward bucket cors requests to meta master zone
+  if (!store->is_meta_master()) {
+    /* only need to keep this data around if we're not meta master */
+    in_data.append(data, len);
+  }
+
   if (s->cct->_conf->subsys.should_gather(ceph_subsys_rgw, 15)) {
     ldout(s->cct, 15) << "CORSConfiguration";
     cors_config->to_xml(*_dout);
@@ -3744,6 +3750,8 @@ int RGW_Auth_S3::authorize_v4(RGWRados *store, struct req_state *s, bool force_b
   s->aws4_auth->canonical_qs = s->info.request_params;
 
   if (!s->aws4_auth->canonical_qs.empty()) {
+
+    boost::replace_all(s->aws4_auth->canonical_qs, "+", "%20");
 
     /* handle case when query string exists. Step 3 in
      * http://docs.aws.amazon.com/general/latest/gr/sigv4-create-canonical-request.html */

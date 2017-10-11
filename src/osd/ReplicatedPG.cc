@@ -1620,17 +1620,17 @@ void ReplicatedPG::do_op(OpRequestRef& op)
     }
   }
 
+  if (!op_has_sufficient_caps(op)) {
+    osd->reply_op_error(op, -EPERM);
+    return;
+  }
+
   if (op->includes_pg_op()) {
     if (pg_op_must_wait(m)) {
       wait_for_all_missing(op);
       return;
     }
     return do_pg_op(op);
-  }
-
-  if (!op_has_sufficient_caps(op)) {
-    osd->reply_op_error(op, -EPERM);
-    return;
   }
 
   hobject_t head(m->get_oid(), m->get_object_locator().key,
@@ -1684,12 +1684,14 @@ void ReplicatedPG::do_op(OpRequestRef& op)
   // discard due to cluster full transition?  (we discard any op that
   // originates before the cluster or pool is marked full; the client
   // will resend after the full flag is removed or if they expect the
-  // op to succeed despite being full).  The except is FULL_FORCE ops,
-  // which there is no reason to discard because they bypass all full
-  // checks anyway.
-  // If this op isn't write or read-ordered, we skip
+  // op to succeed despite being full).  The except is FULL_FORCE and
+  // FULL_TRY ops, which there is no reason to discard because they
+  // bypass all full checks anyway.  If this op isn't write or
+  // read-ordered, we skip.
   // FIXME: we exclude mds writes for now.
-  if (write_ordered && !( m->get_source().is_mds() || m->has_flag(CEPH_OSD_FLAG_FULL_FORCE)) &&
+  if (write_ordered && !(m->get_source().is_mds() ||
+			 m->has_flag(CEPH_OSD_FLAG_FULL_TRY) ||
+			 m->has_flag(CEPH_OSD_FLAG_FULL_FORCE)) &&
       info.history.last_epoch_marked_full > m->get_map_epoch()) {
     dout(10) << __func__ << " discarding op sent before full " << m << " "
 	     << *m << dendl;
@@ -8318,7 +8320,7 @@ void ReplicatedPG::op_applied(const eversion_t &applied_version)
   last_update_applied = applied_version;
   if (is_primary()) {
     if (scrubber.active) {
-      if (last_update_applied == scrubber.subset_last_update) {
+      if (last_update_applied >= scrubber.subset_last_update) {
         requeue_scrub();
       }
     } else {
@@ -8326,7 +8328,7 @@ void ReplicatedPG::op_applied(const eversion_t &applied_version)
     }
   } else {
     if (scrubber.active_rep_scrub) {
-      if (last_update_applied == static_cast<MOSDRepScrub*>(
+      if (last_update_applied >= static_cast<MOSDRepScrub*>(
 	    scrubber.active_rep_scrub->get_req())->scrub_to) {
 	osd->op_wq.queue(
 	  make_pair(
@@ -8579,6 +8581,7 @@ void ReplicatedPG::simple_opc_submit(OpContextUPtr ctx)
   dout(20) << __func__ << " " << repop << dendl;
   issue_repop(repop, ctx.get());
   eval_repop(repop);
+  calc_trim_to();
   repop->put();
 }
 
@@ -9996,7 +9999,8 @@ void ReplicatedPG::on_removal(ObjectStore::Transaction *t)
 
   write_if_dirty(*t);
 
-  on_shutdown();
+  if (!deleting)
+    on_shutdown();
 }
 
 void ReplicatedPG::on_shutdown()
@@ -10020,6 +10024,8 @@ void ReplicatedPG::on_shutdown()
   cancel_flush_ops(false);
   cancel_proxy_ops(false);
   apply_and_flush_repops(false);
+  // clean up snap trim references
+  snap_trimmer_machine.process_event(Reset());
 
   pgbackend->on_change();
 

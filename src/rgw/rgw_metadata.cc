@@ -150,11 +150,17 @@ int RGWMetadataLog::list_entries(void *handle,
     return 0;
   }
 
+  std::string next_marker;
   int ret = store->time_log_list(ctx->cur_oid, ctx->from_time, ctx->end_time,
 				 max_entries, entries, ctx->marker,
-				 last_marker, truncated);
+				 &next_marker, truncated);
   if ((ret < 0) && (ret != -ENOENT))
     return ret;
+
+  ctx->marker = std::move(next_marker);
+  if (last_marker) {
+    *last_marker = ctx->marker;
+  }
 
   if (ret == -ENOENT)
     *truncated = false;
@@ -220,7 +226,7 @@ int RGWMetadataLog::trim(int shard_id, const real_time& from_time, const real_ti
 
   ret = store->time_log_trim(oid, from_time, end_time, start_marker, end_marker);
 
-  if (ret == -ENOENT)
+  if (ret == -ENOENT || ret == -ENODATA)
     ret = 0;
 
   return ret;
