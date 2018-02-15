@@ -44,10 +44,12 @@ tar -C $releasedir -jxf $releasedir/ceph_$vers.orig.tar.bz2
 # copy the debian directory over and remove -dbg packages
 # because they are large and take time to build
 #
-cp -a debian $releasedir/ceph-$vers/debian
-cd $releasedir
-perl -ni -e 'print if(!(/^Package: .*-dbg$/../^$/))' ceph-$vers/debian/control
-perl -pi -e 's/--dbg-package.*//' ceph-$vers/debian/rules
+if [ "$WANT_DEBUG" != "1" ]; then
+    cp -a debian $releasedir/ceph-$vers/debian
+    cd $releasedir
+    perl -ni -e 'print if(!(/^Package: .*-dbg$/../^$/))' ceph-$vers/debian/control
+    perl -pi -e 's/--dbg-package.*//' ceph-$vers/debian/rules
+fi
 #
 # always set the debian version to 1 which is ok because the debian
 # directory is included in the sources and the upstream version will
