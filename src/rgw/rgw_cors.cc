@@ -21,7 +21,6 @@
 #include "include/types.h"
 #include "common/debug.h"
 #include "include/str_list.h"
-#include "common/ceph_json.h"
 #include "common/Formatter.h"
 
 #include "rgw_cors.h"
@@ -51,15 +50,6 @@ void RGWCORSRule::erase_origin_if_present(string& origin, bool *rule_empty) {
     allowed_origins.erase(it);
     *rule_empty = (allowed_origins.empty());
   }
-}
-
-void RGWCORSRule::dump(Formatter *f) const {
-  encode_json("max_age", max_age, f);
-  encode_json("allowed_methods", static_cast<unsigned>(allowed_methods), f);
-  encode_json("id", id, f);
-  encode_json("allowed_hdrs", allowed_hdrs, f);
-  encode_json("allowed_origins", allowed_origins, f);
-  encode_json("exposable_hdrs", exposable_hdrs, f);
 }
 
 /*
@@ -187,10 +177,6 @@ void RGWCORSConfiguration::erase_host_name_rule(string& origin) {
       break;
     }
   }
-}
-
-void RGWCORSConfiguration::dump(Formatter *f) const {
-  encode_json("rules", rules, f);
 }
 
 void RGWCORSConfiguration::dump() {
