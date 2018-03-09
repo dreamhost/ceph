@@ -1018,6 +1018,12 @@ int RESTArgs::get_time(struct req_state *s, const string& name,
   uint64_t epoch, nsec;
 
   int r = utime_t::parse_date(sval, &epoch, &nsec);
+  ldout(s->cct, 20) << "RESTArgs::get_time: "
+    << name << "='" << sval << "'"
+    << " r=" << r <<
+    << " epoch=" << epoch <<
+    << " nsec=" << nsec <<
+    << dendl;
   if (r < 0)
     return r;
 
@@ -1040,6 +1046,11 @@ int RESTArgs::get_epoch(struct req_state *s, const string& name, uint64_t def_va
   }
 
   int r = utime_t::parse_date(date, epoch, NULL);
+  ldout(s->cct, 20) << "RESTArgs::get_epoch: "
+    << name << "='" << date << "'"
+    << " r=" << r <<
+    << " epoch=" << epoch <<
+    << dendl;
   if (r < 0)
     return r;
 
