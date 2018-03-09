@@ -29,17 +29,42 @@ void RGWOp_Usage_Get::execute() {
   uint64_t start, end;
   bool show_entries;
   bool show_summary;
+  int r;
 
-  RESTArgs::get_string(s, "uid", uid_str, &uid_str);
+  r = RESTArgs::get_string(s, "uid", uid_str, &uid_str);
+  if(r < 0) {
+    http_ret = -EINVAL;
+    return;
+  }
   rgw_user uid(uid_str);
 
-  RESTArgs::get_epoch(s, "start", 0, &start);
-  RESTArgs::get_epoch(s, "end", (uint64_t)-1, &end);
-  RESTArgs::get_bool(s, "show-entries", true, &show_entries);
-  RESTArgs::get_bool(s, "show-summary", true, &show_summary);
+  r = RESTArgs::get_epoch(s, "start", 0, &start);
+  if(r < 0) {
+    http_ret = -EINVAL;
+    return;
+  }
+  r = RESTArgs::get_epoch(s, "end", (uint64_t)-1, &end);
+  if(r < 0) {
+    http_ret = -EINVAL;
+    return;
+  }
+  r = RESTArgs::get_bool(s, "show-entries", true, &show_entries);
+  if(r < 0) {
+    http_ret = -EINVAL;
+    return;
+  }
+  r = RESTArgs::get_bool(s, "show-summary", true, &show_summary);
+  if(r < 0) {
+    http_ret = -EINVAL;
+    return;
+  }
 
   string cat_str;
-  RESTArgs::get_string(s, "categories", cat_str, &cat_str);
+  r = RESTArgs::get_string(s, "categories", cat_str, &cat_str);
+  if(r < 0) {
+    http_ret = -EINVAL;
+    return;
+  }
 
   if (!cat_str.empty()) {
     list<string> cat_list;
@@ -69,12 +94,25 @@ public:
 void RGWOp_Usage_Delete::execute() {
   string uid_str;
   uint64_t start, end;
+  int r;
 
-  RESTArgs::get_string(s, "uid", uid_str, &uid_str);
+  r = RESTArgs::get_string(s, "uid", uid_str, &uid_str);
+  if(r < 0) {
+    http_ret = -EINVAL;
+    return;
+  }
   rgw_user uid(uid_str);
 
-  RESTArgs::get_epoch(s, "start", 0, &start);
-  RESTArgs::get_epoch(s, "end", (uint64_t)-1, &end);
+  r = RESTArgs::get_epoch(s, "start", 0, &start);
+  if(r < 0) {
+    http_ret = -EINVAL;
+    return;
+  }
+  r = RESTArgs::get_epoch(s, "end", (uint64_t)-1, &end);
+  if(r < 0) {
+    http_ret = -EINVAL;
+    return;
+  }
 
   if (uid.empty() &&
       !start &&
